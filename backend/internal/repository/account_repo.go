@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -520,6 +521,23 @@ func (r *accountRepository) updateLockedAccount(
 		return nil, err
 	}
 	account.Extra = extra
+	if explicitRateMultiplier != nil && !accountRateSyncEnabledInExtra(extra) {
+		extra[service.ManualRateMultiplierExtraKey] = *explicitRateMultiplier
+	}
+
+	// Once upstream ownership is disabled, the administrator-owned multiplier
+	// becomes authoritative again. This must happen in the same transaction as
+	// the extra flags, otherwise billing can keep using the last upstream value.
+	restoreManualRate := (explicitRateSyncEnabled != nil && !*explicitRateSyncEnabled) ||
+		(explicitProbeEnabled != nil && !*explicitProbeEnabled)
+	if explicitRateMultiplier == nil && restoreManualRate {
+		rate := 1.0
+		if saved, ok := accountManualRateMultiplierFromExtra(extra); ok {
+			rate = saved
+		}
+		account.RateMultiplier = &rate
+		explicitRateMultiplier = &rate
+	}
 
 	schedulable := account.Schedulable
 	if account.Status == service.StatusError {
@@ -769,6 +787,16 @@ func lockAndMergeAccountProbeExtra(
 				extra[service.OllamaCloudUsageSnapshotExtraKey] = snapshot
 			}
 		}
+	}
+	// Turning upstream rate sync off makes the last administrator-owned value
+	// authoritative again. Keep the probe snapshot for audit, but remove the
+	// live upstream metadata so list views cannot present it as active.
+	if (explicitRateSyncEnabled != nil && !*explicitRateSyncEnabled) ||
+		(explicitProbeEnabled != nil && !*explicitProbeEnabled) {
+		delete(extra, service.UpstreamRateMultiplierExtraKey)
+		delete(extra, service.UpstreamRateSourceExtraKey)
+		delete(extra, service.UpstreamRateObservedAtExtraKey)
+		delete(extra, service.UpstreamBillingProviderExtraKey)
 	}
 	return extra, nil
 }
@@ -2673,7 +2701,22 @@ func (r *accountRepository) updateUpstreamBillingProbeSnapshotInTx(
 	snapshot *service.UpstreamBillingProbeSnapshot,
 	rateMultiplier *float64,
 ) error {
-	payload, err := json.Marshal(map[string]any{service.UpstreamBillingProbeExtraKey: snapshot})
+	extraPayload := map[string]any{service.UpstreamBillingProbeExtraKey: snapshot}
+	if snapshot.Data != nil {
+		if provider, ok := snapshot.Data[service.UpstreamBillingProviderExtraKey].(string); ok && provider != "" {
+			extraPayload[service.UpstreamBillingProviderExtraKey] = provider
+		}
+		if rate, ok := snapshot.Data[service.UpstreamRateMultiplierExtraKey].(float64); ok {
+			extraPayload[service.UpstreamRateMultiplierExtraKey] = rate
+		}
+		if source, ok := snapshot.Data[service.UpstreamRateSourceExtraKey].(string); ok && source != "" {
+			extraPayload[service.UpstreamRateSourceExtraKey] = source
+		}
+		if observedAt, ok := snapshot.Data[service.UpstreamRateObservedAtExtraKey].(string); ok && observedAt != "" {
+			extraPayload[service.UpstreamRateObservedAtExtraKey] = observedAt
+		}
+	}
+	payload, err := json.Marshal(extraPayload)
 	if err != nil {
 		return err
 	}
@@ -2720,7 +2763,14 @@ func (r *accountRepository) updateUpstreamBillingProbeSnapshotInTx(
 	result, err := client.ExecContext(ctx, `
 		UPDATE accounts
 		SET
-			extra = COALESCE(extra, '{}'::jsonb) || $1::jsonb,
+			extra = CASE
+				WHEN $10::numeric IS NOT NULL AND NOT (COALESCE(extra, '{}'::jsonb) ? 'manual_rate_multiplier')
+				THEN jsonb_set(
+					COALESCE(extra, '{}'::jsonb) || $1::jsonb,
+					'{manual_rate_multiplier}', to_jsonb(COALESCE(rate_multiplier, 1.0::numeric)), true
+				)
+				ELSE COALESCE(extra, '{}'::jsonb) || $1::jsonb
+			END,
 			rate_multiplier = CASE
 				WHEN $10::numeric IS NOT NULL
 					AND extra @> '{"upstream_billing_probe_enabled": true}'::jsonb
@@ -2750,6 +2800,53 @@ func (r *accountRepository) updateUpstreamBillingProbeSnapshotInTx(
 		return service.ErrUpstreamBillingProbeIdentityChanged
 	}
 	return enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, nil)
+}
+
+func accountRateSyncEnabledInExtra(extra map[string]any) bool {
+	if extra == nil {
+		return false
+	}
+	enabled, ok := extra[service.UpstreamBillingRateSyncEnabledExtraKey].(bool)
+	return ok && enabled
+}
+
+func accountManualRateMultiplierFromExtra(extra map[string]any) (float64, bool) {
+	if extra == nil {
+		return 0, false
+	}
+	value, ok := extra[service.ManualRateMultiplierExtraKey]
+	if !ok {
+		return 0, false
+	}
+	var rate float64
+	switch value := value.(type) {
+	case float64:
+		rate = value
+	case float32:
+		rate = float64(value)
+	case int:
+		rate = float64(value)
+	case int64:
+		rate = float64(value)
+	case json.Number:
+		parsed, err := value.Float64()
+		if err != nil {
+			return 0, false
+		}
+		rate = parsed
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil {
+			return 0, false
+		}
+		rate = parsed
+	default:
+		return 0, false
+	}
+	if rate < 0 || math.IsNaN(rate) || math.IsInf(rate, 0) {
+		return 0, false
+	}
+	return rate, true
 }
 
 func lockAndMatchProbeProxyIdentity(ctx context.Context, client *dbent.Client, account *service.Account) (bool, error) {

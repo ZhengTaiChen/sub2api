@@ -226,6 +226,46 @@ func newUpstreamBillingProbeTestService(
 	return NewUpstreamBillingProbeService(repo, accountTestService, NewSettingService(settingRepo, cfg))
 }
 
+func TestShuaiAPIUsageURLAndResponseParsing(t *testing.T) {
+	require.True(t, isShuaiAPIAccount(&Account{Credentials: map[string]any{"provider": "shuai_api"}}, "https://example.invalid/v1"))
+	require.True(t, isShuaiAPIAccount(nil, "https://api.shuaiapi.com/v1/"))
+	require.Equal(t, "https://api.shuaiapi.com/api/usage/token/", buildShuaiUsageURL("https://api.shuaiapi.com/v1/"))
+	require.Equal(t, "https://api.shuaiapi.com/custom/api/usage/token/", buildShuaiUsageURL("https://api.shuaiapi.com/custom/v1"))
+
+	data, err := parseShuaiAPIUsageResponse([]byte(`{
+		"code":true,
+		"data":{
+			"object":"token_usage",
+			"display":{"remaining":12.5},
+			"total_available":999999,
+			"effective_rate_multiplier":0.5,
+			"rate_multiplier":0.8
+		}
+	}`))
+	require.NoError(t, err)
+	require.Equal(t, 12.5, data["balance"])
+	require.Equal(t, 0.5, data["effective_rate_multiplier"])
+	require.Equal(t, "USD", data["unit"])
+
+	data, err = parseShuaiAPIUsageResponse([]byte(`{"code":true,"data":{"object":"token_usage","total_available":500000,"rate":0.25}}`))
+	require.NoError(t, err)
+	require.Equal(t, 1.0, data["balance"])
+	require.Equal(t, 0.25, data["effective_rate_multiplier"])
+}
+
+func TestShuaiAPIUsageInvalidRateDoesNotInvalidateBalance(t *testing.T) {
+	data, err := parseShuaiAPIUsageResponse([]byte(`{"code":true,"data":{"object":"token_usage","display":{"remaining":3.25},"rate_multiplier":"not-a-number"}}`))
+	require.NoError(t, err)
+	require.Equal(t, 3.25, data["balance"])
+	_, ok := data["effective_rate_multiplier"]
+	require.False(t, ok)
+
+	_, err = parseShuaiAPIUsageResponse([]byte(`{"code":false,"data":{}}`))
+	require.Error(t, err)
+	_, err = parseShuaiAPIUsageResponse([]byte(`{"code":true,"data":{"object":"other"}}`))
+	require.Error(t, err)
+}
+
 func TestUpstreamBillingProbeSettingsDefaultsAndValidation(t *testing.T) {
 	repo := &upstreamBillingProbeSettingRepo{}
 	settingsService := NewSettingService(repo, &config.Config{})
@@ -908,6 +948,27 @@ func TestUpstreamBillingProbeUnsupportedAndAccountToggle(t *testing.T) {
 	require.True(t, errors.Is(err, ErrUpstreamBillingProbeAccountInvalid))
 }
 
+func TestAccountManualRateMultiplierDoesNotUseActiveUpstreamRateWithoutBackup(t *testing.T) {
+	upstreamRate := 0.5
+	account := &Account{
+		RateMultiplier: &upstreamRate,
+		Extra: map[string]any{
+			UpstreamBillingProbeEnabledExtraKey:    true,
+			UpstreamBillingRateSyncEnabledExtraKey: true,
+		},
+	}
+
+	got, ok := accountManualRateMultiplier(account)
+
+	require.False(t, ok)
+	require.Zero(t, got)
+
+	manualRate := 1.25
+	account.Extra[ManualRateMultiplierExtraKey] = manualRate
+	got, ok = accountManualRateMultiplier(account)
+	require.True(t, ok)
+	require.Equal(t, manualRate, got)
+}
 func TestUpstreamBillingProbeRunnerIsBoundedAndManualProbeIgnoresSwitches(t *testing.T) {
 	accounts := make(map[int64]*Account, 25)
 	for id := int64(1); id <= 25; id++ {

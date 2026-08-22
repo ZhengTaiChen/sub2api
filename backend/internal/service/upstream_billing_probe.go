@@ -32,6 +32,11 @@ const (
 	UpstreamBillingProbeExtraKey           = "upstream_billing_probe"
 	UpstreamBillingProbeEnabledExtraKey    = "upstream_billing_probe_enabled"
 	UpstreamBillingRateSyncEnabledExtraKey = "upstream_billing_rate_sync_enabled"
+	UpstreamBillingProviderExtraKey        = "upstream_billing_provider"
+	UpstreamRateMultiplierExtraKey         = "upstream_rate_multiplier"
+	UpstreamRateSourceExtraKey             = "upstream_rate_source"
+	UpstreamRateObservedAtExtraKey         = "upstream_rate_observed_at"
+	ManualRateMultiplierExtraKey           = "manual_rate_multiplier"
 
 	upstreamBillingProbeDefaultIntervalMinutes = 30
 	upstreamBillingProbeMinIntervalMinutes     = 5
@@ -49,6 +54,9 @@ const (
 	upstreamBillingProbeAccountRateScale       = 10000.0
 	upstreamBillingProbeLeaderLockKey          = "upstream:billing:probe:leader"
 	upstreamBillingProbeLeaderLockTTL          = 2 * time.Minute
+	upstreamBillingShuaiRequestTimeout         = 2 * time.Second
+	upstreamBillingShuaiFreshTTL               = 10 * time.Minute
+	upstreamBillingShuaiMaxBodyBytes           = 32 * 1024
 )
 
 // UpstreamBillingProbeMaxBatchSize limits one manual batch and one runner cycle.
@@ -578,6 +586,18 @@ func (s *UpstreamBillingProbeService) SetAccountEnabled(ctx context.Context, acc
 	if !isUpstreamBillingProbeAccount(account) {
 		return ErrUpstreamBillingProbeAccountInvalid
 	}
+	if !enabled {
+		// Disabling probing also disables synchronization and restores the last
+		// administrator-set multiplier when the repository supports the atomic
+		// account billing update path.
+		if updater, ok := s.accountRepo.(AccountBillingSettingsRepository); ok {
+			var manual *float64
+			if value, valid := accountManualRateMultiplier(account); valid {
+				manual = &value
+			}
+			return updater.UpdateWithAccountBillingSettings(ctx, account, boolPtr(false), boolPtr(false), manual)
+		}
+	}
 	updates := map[string]any{UpstreamBillingProbeEnabledExtraKey: enabled}
 	if !enabled {
 		updates[UpstreamBillingRateSyncEnabledExtraKey] = false
@@ -600,12 +620,13 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 	if account.IsCNProvider() && account.IsAdaptiveAPIProtocol() {
 		baseURL = account.GetCNProtocolBaseURL(APIProtocolChatCompletions)
 	}
-	if account.Platform == PlatformOpenAI {
+	shuaiAPI := isShuaiAPIAccount(account, baseURL)
+	if account.Platform == PlatformOpenAI && !shuaiAPI {
 		if baseURL == "" {
 			// 保持官方语义：OpenAI 账号无自定义 base 时探官方域（404 → unsupported）。
 			baseURL = "https://api.openai.com"
 		}
-	} else if upstreamBillingProbeTargetIsOfficialAPI(baseURL) {
+	} else if !shuaiAPI && upstreamBillingProbeTargetIsOfficialAPI(baseURL) {
 		// 其他平台 base_url 为空或指向官方 API 根域（前端创建时会把空值
 		// 填成官方默认域，且提供 us-east-1.api.x.ai 等官方区域预设）⇒
 		// 必无 /v1/sub2api/billing；不发请求，直接记 unsupported，避免
@@ -627,7 +648,14 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		proxyURL = account.Proxy.URL()
 	}
 	probeURL := buildOpenAIEndpointURL(normalizedBaseURL, "/v1/sub2api/billing")
-	probeCtx, cancel := context.WithTimeout(ctx, upstreamBillingProbeRequestTimeout)
+	if shuaiAPI {
+		probeURL = buildShuaiUsageURL(normalizedBaseURL)
+	}
+	probeTimeout := upstreamBillingProbeRequestTimeout
+	if shuaiAPI {
+		probeTimeout = upstreamBillingShuaiRequestTimeout
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, bytes.NewReader(nil))
 	if err != nil {
@@ -642,6 +670,9 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 	req = req.WithContext(WithHTTPUpstreamRedirectsDisabled(reqCtx))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if shuaiAPI {
+		req.Header.Set("User-Agent", "cc-switch/1.0")
+	}
 	account.ApplyHeaderOverrides(req.Header)
 	var tlsProfile *tlsfingerprint.Profile
 	if s.accountTestService.tlsFPProfileService != nil {
@@ -655,11 +686,15 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		return s.persistProbeFailure(ctx, account, intervalMinutes, now, 0, "empty_response", 0)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, upstreamBillingProbeMaxBodyBytes+1))
+	maxBodyBytes := upstreamBillingProbeMaxBodyBytes
+	if shuaiAPI {
+		maxBodyBytes = upstreamBillingShuaiMaxBodyBytes
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(maxBodyBytes)+1))
 	if readErr != nil {
 		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "response_read_failed", retryAfter(resp.Header, now))
 	}
-	if len(body) > upstreamBillingProbeMaxBodyBytes {
+	if len(body) > maxBodyBytes {
 		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "response_too_large", retryAfter(resp.Header, now))
 	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
@@ -668,7 +703,12 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "http_error", retryAfter(resp.Header, now))
 	}
-	data, err := parseUpstreamBillingProbeResponse(body)
+	var data map[string]any
+	if shuaiAPI {
+		data, err = parseShuaiAPIUsageResponse(body)
+	} else {
+		data, err = parseUpstreamBillingProbeResponse(body)
+	}
 	if err != nil {
 		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "invalid_response", retryAfter(resp.Header, now))
 	}
@@ -681,17 +721,33 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		NextProbeAt:   now.Add(nextProbeDelay(intervalMinutes, 0)),
 		HTTPStatus:    resp.StatusCode,
 	}
+	if shuaiAPI {
+		snapshot.FreshUntil = probeTimePtr(now.Add(upstreamBillingShuaiFreshTTL))
+		snapshot.Data["rate_source"] = "shuai_api_usage"
+		snapshot.Data["checked_at"] = now.UTC().Format(time.RFC3339Nano)
+	}
 	// 账号级值域与精度只在真要写回时才有影响：只观察上游声明、未开启同步的
 	// 账号不因声明值不适配 accounts.rate_multiplier 而被记成探测失败并进入
 	// 指数退避——探测本身成功了，原始声明照常存进快照供展示。
 	var syncRate *float64
 	previousRate := account.BillingRateMultiplier()
 	if upstreamBillingRateSyncEnabled(account) {
-		if value, valid := upstreamBillingProbeSyncRate(data); valid {
+		value, valid := upstreamBillingProbeSyncRate(data)
+		if shuaiAPI {
+			value, valid = shuaiAPIUsageSyncRate(data)
+		}
+		if valid {
 			syncRate = &value
 			snapshot.SyncedRateMultiplier = &value
+			if snapshot.Data == nil {
+				snapshot.Data = make(map[string]any)
+			}
+			snapshot.Data[UpstreamBillingProviderExtraKey] = map[bool]string{true: "shuai_api", false: "sub2api"}[shuaiAPI]
+			snapshot.Data[UpstreamRateMultiplierExtraKey] = value
+			snapshot.Data[UpstreamRateSourceExtraKey] = map[bool]string{true: "shuai_api_usage", false: "sub2api_billing"}[shuaiAPI]
+			snapshot.Data[UpstreamRateObservedAtExtraKey] = now.UTC().Format(time.RFC3339Nano)
 		} else {
-			declared, _ := resolveAccountExtraNumber(data, "resolved_rate_multiplier")
+			declared, _ := resolveAccountExtraNumber(data, "resolved_rate_multiplier", "effective_rate_multiplier", "rate_multiplier")
 			slog.Warn("upstream_billing_rate_sync_rejected",
 				"source", "upstream_billing_probe",
 				"account_id", account.ID,
@@ -850,6 +906,174 @@ func parseUpstreamBillingProbeResponse(body []byte) (map[string]any, error) {
 		return nil, fmt.Errorf("inconsistent effective billing multiplier")
 	}
 	return data, nil
+}
+
+// isShuaiAPIAccount identifies the 帅API usage endpoint without requiring a
+// schema migration. The explicit provider marker is useful for custom domains
+// and is intentionally checked before host matching.
+func isShuaiAPIAccount(account *Account, baseURL string) bool {
+	if account != nil && strings.EqualFold(strings.TrimSpace(account.GetCredential("provider")), "shuai_api") {
+		return true
+	}
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	return host == "shuaiapi.com" || strings.HasSuffix(host, ".shuaiapi.com")
+}
+
+func buildShuaiUsageURL(baseURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/api/usage/token/"
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	// Account forms commonly store an OpenAI-compatible /v1 base. The 帅API
+	// endpoint is rooted at /api, so avoid producing /v1/api/usage/token/.
+	if strings.HasSuffix(strings.ToLower(path), "/v1") {
+		path = path[:len(path)-len("/v1")]
+	}
+	parsed.Path = strings.TrimRight(path, "/") + "/api/usage/token/"
+	parsed.RawPath = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+// parseShuaiAPIUsageResponse keeps only the small, administrator-visible
+// snapshot needed for balance/rate display. Credentials and arbitrary upstream
+// fields are deliberately discarded. A malformed rate does not invalidate an
+// otherwise usable balance response.
+func parseShuaiAPIUsageResponse(body []byte) (map[string]any, error) {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, err
+	}
+	code, ok := root["code"].(bool)
+	if !ok || !code {
+		return nil, fmt.Errorf("invalid shuai api response code")
+	}
+	data, ok := root["data"].(map[string]any)
+	if !ok || data == nil {
+		return nil, fmt.Errorf("missing shuai api response data")
+	}
+	if object, exists := data["object"]; exists {
+		if value, valid := object.(string); valid && value != "" && value != "token_usage" {
+			return nil, fmt.Errorf("unexpected shuai api response object")
+		}
+	}
+
+	result := map[string]any{"billing_provider": "shuai_api", "rate_source": "shuai_api_usage"}
+	if object, ok := data["object"].(string); ok && object != "" {
+		result["object"] = object
+	}
+	if display, ok := data["display"].(map[string]any); ok {
+		if remaining, valid := finiteNonNegativeJSONNumber(display["remaining"]); valid {
+			result["balance"] = remaining
+			result["unit"] = "USD"
+		}
+	}
+	if _, exists := result["balance"]; !exists {
+		if available, valid := finiteNonNegativeJSONNumber(data["total_available"]); valid {
+			result["balance"] = available / 500000
+			result["unit"] = "USD"
+		} else {
+			granted, grantedOK := finiteNonNegativeJSONNumber(data["total_granted"])
+			used, usedOK := finiteNonNegativeJSONNumber(data["total_used"])
+			if grantedOK && usedOK && granted >= used {
+				result["balance"] = (granted - used) / 500000
+				result["unit"] = "USD"
+			}
+		}
+	}
+
+	// Upstream aliases are accepted in the documented order. Invalid values are
+	// ignored so balance display remains useful and does not become a zero-rate
+	// write-back.
+	rateKeys := []string{"effective_rate_multiplier", "resolved_rate_multiplier", "rate_multiplier", "multiplier", "rate"}
+	for _, key := range rateKeys {
+		if value, valid := finiteNonNegativeJSONNumber(data[key]); valid {
+			result[key] = value
+			result["effective_rate_multiplier"] = value
+			break
+		}
+	}
+	if _, exists := result["effective_rate_multiplier"]; !exists {
+		for _, key := range rateKeys {
+			if value, valid := finiteNonNegativeJSONNumber(root[key]); valid {
+				result[key] = value
+				result["effective_rate_multiplier"] = value
+				break
+			}
+		}
+	}
+	if observedAt, ok := data["observed_at"].(string); ok && strings.TrimSpace(observedAt) != "" {
+		result["observed_at"] = observedAt
+	}
+	return result, nil
+}
+
+func finiteNonNegativeJSONNumber(value any) (float64, bool) {
+	var number float64
+	switch v := value.(type) {
+	case float64:
+		number = v
+	case float32:
+		number = float64(v)
+	case int:
+		number = float64(v)
+	case int64:
+		number = float64(v)
+	case json.Number:
+		parsed, err := v.Float64()
+		if err != nil {
+			return 0, false
+		}
+		number = parsed
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return 0, false
+		}
+		number = parsed
+	default:
+		return 0, false
+	}
+	return number, number >= 0 && !math.IsNaN(number) && !math.IsInf(number, 0)
+}
+
+func shuaiAPIUsageSyncRate(data map[string]any) (float64, bool) {
+	value, ok := resolveAccountExtraNumber(data, "effective_rate_multiplier")
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return 0, false
+	}
+	rounded := math.Round(value*upstreamBillingProbeAccountRateScale) / upstreamBillingProbeAccountRateScale
+	if rounded < 0 || rounded > upstreamBillingRateSyncMaxMultiplier {
+		return 0, false
+	}
+	return rounded, true
+}
+
+func accountManualRateMultiplier(account *Account) (float64, bool) {
+	if account == nil {
+		return 0, false
+	}
+	if value, ok := resolveAccountExtraNumber(account.Extra, ManualRateMultiplierExtraKey); ok &&
+		!math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0 {
+		return value, true
+	}
+	// When sync is active, the database column may contain the last upstream
+	// value rather than an administrator-owned value. Without an explicit
+	// backup, let the repository restore its documented 1.0 default instead of
+	// accidentally treating that upstream value as the manual fallback.
+	if upstreamBillingRateSyncEnabled(account) {
+		return 0, false
+	}
+	if account.RateMultiplier != nil && *account.RateMultiplier >= 0 &&
+		!math.IsNaN(*account.RateMultiplier) && !math.IsInf(*account.RateMultiplier, 0) {
+		return *account.RateMultiplier, true
+	}
+	return 0, false
 }
 
 func upstreamBillingRateAt(data map[string]any, now time.Time) (float64, bool) {
