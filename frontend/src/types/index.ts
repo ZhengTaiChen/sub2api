@@ -1015,20 +1015,35 @@ export interface TempUnschedulableStatus {
 }
 
 export interface UpstreamBillingData {
-  object: 'sub2api.key_billing'
-  schema_version: 1
-  billing_scope: 'token'
-  group_rate_multiplier: number
-  user_rate_multiplier?: number
-  resolved_rate_multiplier: number
-  peak_rate_enabled: boolean
-  peak_start?: string
-  peak_end?: string
-  peak_rate_multiplier?: number
-  applied_peak_multiplier?: number
-  effective_rate_multiplier: number
-  timezone?: string
-  observed_at: string
+	object?: 'sub2api.key_billing' | 'token_usage' | string
+	schema_version?: number
+	billing_scope?: 'token' | string
+	group_rate_multiplier?: number
+	user_rate_multiplier?: number
+	resolved_rate_multiplier?: number
+	peak_rate_enabled?: boolean
+	peak_start?: string
+	peak_end?: string
+	peak_rate_multiplier?: number
+	applied_peak_multiplier?: number
+	effective_rate_multiplier?: number
+	timezone?: string
+	observed_at?: string
+	billing_provider?: string
+	rate_source?: string
+	upstream_rate_source?: string
+	upstream_rate_multiplier?: number
+	upstream_rate_observed_at?: string
+	balance?: number
+	unit?: string
+	upstream_balance?: number
+	upstream_balance_unit?: string
+	upstream_balance_type?: string
+	upstream_balance_source?: string
+	upstream_balance_observed_at?: string
+	upstream_balance_error?: string
+	balance_error?: string
+	checked_at?: string
 }
 
 export type UpstreamBillingProbeStatus = 'ok' | 'unsupported' | 'failed'

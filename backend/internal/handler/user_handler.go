@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,14 @@ type UserHandler struct {
 	emailCache            service.EmailCache
 	affiliateService      *service.AffiliateService
 	userPlatformQuotaRepo service.UserPlatformQuotaRepository
+	apiKeyService         *service.APIKeyService
+	accountService        *service.AccountService
+}
+
+// SetUpstreamBillingDependencies wires optional user-facing upstream billing support.
+func (h *UserHandler) SetUpstreamBillingDependencies(apiKeyService *service.APIKeyService, accountService *service.AccountService) {
+	h.apiKeyService = apiKeyService
+	h.accountService = accountService
 }
 
 // NewUserHandler creates a new UserHandler
@@ -70,6 +80,114 @@ func (h *UserHandler) GetMyPlatformQuotas(c *gin.Context) {
 }
 
 // ChangePasswordRequest represents the change password request payload
+type userUpstreamBillingAccount struct {
+	AccountID      int64    `json:"account_id"`
+	Name           string   `json:"name"`
+	Platform       string   `json:"platform"`
+	RateMultiplier *float64 `json:"rate_multiplier,omitempty"`
+	Balance        *float64 `json:"balance,omitempty"`
+	Unit           string   `json:"unit,omitempty"`
+	BalanceType    string   `json:"balance_type,omitempty"`
+	BalanceSource  string   `json:"balance_source,omitempty"`
+	BalanceError   string   `json:"balance_error,omitempty"`
+	ObservedAt     string   `json:"observed_at,omitempty"`
+	UpdatedAt      string   `json:"updated_at,omitempty"`
+}
+
+func userUpstreamBillingFloat(data map[string]any, key string) *float64 {
+	value, ok := data[key]
+	if !ok {
+		return nil
+	}
+	var out float64
+	switch v := value.(type) {
+	case float64:
+		out = v
+	case float32:
+		out = float64(v)
+	case int:
+		out = float64(v)
+	case int64:
+		out = float64(v)
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return nil
+		}
+		out = parsed
+	default:
+		return nil
+	}
+	if math.IsNaN(out) || math.IsInf(out, 0) {
+		return nil
+	}
+	return &out
+}
+
+func userUpstreamBillingString(data map[string]any, key string) string {
+	if data == nil {
+		return ""
+	}
+	value, _ := data[key].(string)
+	return strings.TrimSpace(value)
+}
+
+// GetUpstreamBilling returns upstream rate and balance snapshots for accounts
+// bound to groups the current user can access.
+// GET /api/v1/user/upstream-billing
+func (h *UserHandler) GetUpstreamBilling(c *gin.Context) {
+	if h.apiKeyService == nil || h.accountService == nil {
+		response.Success(c, map[string]any{"upstream_billing": []userUpstreamBillingAccount{}})
+		return
+	}
+	subject, ok := middleware2.GetAuthSubjectFromContext(c)
+	if !ok {
+		response.Unauthorized(c, "User not authenticated")
+		return
+	}
+	groups, err := h.apiKeyService.GetAvailableGroups(c.Request.Context(), subject.UserID)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	seen := make(map[int64]struct{})
+	out := make([]userUpstreamBillingAccount, 0)
+	for _, group := range groups {
+		accounts, err := h.accountService.ListByGroup(c.Request.Context(), group.ID)
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		for i := range accounts {
+			account := &accounts[i]
+			if _, exists := seen[account.ID]; exists {
+				continue
+			}
+			seen[account.ID] = struct{}{}
+			snapshot, ok := account.Extra[service.UpstreamBillingProbeExtraKey].(map[string]any)
+			if !ok {
+				continue
+			}
+			data, _ := snapshot["data"].(map[string]any)
+			item := userUpstreamBillingAccount{
+				AccountID:      account.ID,
+				Name:           account.Name,
+				Platform:       account.Platform,
+				RateMultiplier: account.RateMultiplier,
+				Balance:        userUpstreamBillingFloat(data, service.UpstreamBalanceExtraKey),
+				Unit:           userUpstreamBillingString(data, service.UpstreamBalanceUnitExtraKey),
+				BalanceType:    userUpstreamBillingString(data, service.UpstreamBalanceTypeExtraKey),
+				BalanceSource:  userUpstreamBillingString(data, service.UpstreamBalanceSourceExtraKey),
+				BalanceError:   userUpstreamBillingString(data, service.UpstreamBalanceErrorExtraKey),
+				ObservedAt:     userUpstreamBillingString(data, service.UpstreamBalanceObservedAtExtraKey),
+				UpdatedAt:      userUpstreamBillingString(snapshot, "received_at"),
+			}
+			out = append(out, item)
+		}
+	}
+	response.Success(c, map[string]any{"upstream_billing": out})
+}
+
 type ChangePasswordRequest struct {
 	OldPassword string `json:"old_password" binding:"required"`
 	NewPassword string `json:"new_password" binding:"required,min=6"`

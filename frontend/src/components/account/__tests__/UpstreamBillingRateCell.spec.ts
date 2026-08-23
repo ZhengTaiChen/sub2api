@@ -100,6 +100,43 @@ describe('UpstreamBillingRateCell', () => {
     )
   })
 
+  it('shows shuai api upstream rate and source label without sub2api billing shape', async () => {
+    const shuaiData = {
+      object: 'token_usage',
+      billing_provider: 'shuai_api',
+      rate_source: 'shuai_api_usage',
+      effective_rate_multiplier: 0.5,
+	  balance: 12.5,
+	  unit: 'USD'
+	}
+    const wrapper = mount(UpstreamBillingRateCell, {
+      attachTo: document.body,
+      props: {
+        account: makeAccount({
+          extra: {
+            upstream_billing_probe: {
+              status: 'ok',
+              data: shuaiData,
+              received_at: '2026-07-13T00:00:00Z',
+              fresh_until: '2026-07-14T00:00:00Z',
+              last_attempt_at: '2026-07-13T00:00:00Z',
+              next_probe_at: '2026-07-13T00:30:00Z'
+            }
+          }
+        }),
+        now: Date.now()
+      }
+    })
+    expect(wrapper.get('[data-testid="upstream-billing-rate"]').text()).toBe('0.50x')
+    await wrapper.get('[data-testid="upstream-billing-details"]').trigger('mouseenter')
+    await flushPromises()
+    const tooltips = document.body.querySelectorAll('[role="tooltip"]')
+    const tooltip = tooltips[tooltips.length - 1] as HTMLElement
+    expect(tooltip.textContent).toContain('admin.accounts.upstreamBilling.rateSource:admin.accounts.upstreamBilling.shuaiApiUsage')
+    expect(tooltip.textContent).toContain('admin.accounts.upstreamBilling.balance:12.5 USD')
+    wrapper.unmount()
+  })
+
   it('uses retained failed data only while it is still fresh', async () => {
     const account = makeAccount({
       extra: {

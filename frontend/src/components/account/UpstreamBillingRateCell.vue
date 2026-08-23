@@ -28,8 +28,17 @@
                 : t('admin.accounts.upstreamBilling.noPeakRate')
             }}
           </p>
-          <p>{{ t('admin.accounts.upstreamBilling.effectiveRate', { value: currentEffectiveRate ?? '-' }) }}</p>
-          <p>{{ t('admin.accounts.upstreamBilling.updatedAt', { value: formatDate(snapshot?.received_at) }) }}</p>
+		  <p>{{ t('admin.accounts.upstreamBilling.effectiveRate', { value: currentEffectiveRate ?? '-' }) }}</p>
+		  <p>{{ t('admin.accounts.upstreamBilling.updatedAt', { value: formatDate(snapshot?.received_at) }) }}</p>
+		  <p v-if="sourceLabel" data-testid="upstream-billing-source">
+		    {{ t('admin.accounts.upstreamBilling.rateSource', { value: sourceLabel }) }}
+		  </p>
+		  <p v-if="balanceValue != null" data-testid="upstream-billing-balance" :class="{ 'text-red-500 dark:text-red-400': balanceLow }">
+		    {{ t('admin.accounts.upstreamBilling.balance', { value: balanceText }) }}
+		  </p>
+		  <p v-else-if="balanceError" data-testid="upstream-billing-balance-error">
+		    {{ t('admin.accounts.upstreamBilling.balanceUnknown') }}
+		  </p>
         </template>
         <template v-else-if="stale && lastDetectedRate != null">
           <p data-testid="upstream-billing-last-rate">
@@ -161,6 +170,10 @@ const minuteInTimeZone = (timestamp: number, timeZone?: string) => {
 const currentEffectiveRate = computed(() => {
   const billing = data.value
   if (!billing) return null
+  if (billing.billing_scope == null) {
+    const fallback = billing.effective_rate_multiplier
+    return typeof fallback === 'number' && Number.isFinite(fallback) && fallback >= 0 ? fallback : null
+  }
   if (billing.billing_scope !== 'token') return null
   const base = billing.resolved_rate_multiplier
   if (typeof base !== 'number' || !Number.isFinite(base) || base < 0) return null
@@ -180,6 +193,28 @@ const lastDetectedRate = computed(() => {
     ? Number(value.toPrecision(12))
     : null
 })
+const sourceLabel = computed(() => {
+  const billing = data.value
+  if (!billing) return ''
+  const source = billing.upstream_rate_source ?? billing.rate_source ?? billing.billing_provider
+  if (source === 'shuai_api_usage' || source === 'shuai_api') return t('admin.accounts.upstreamBilling.shuaiApiUsage')
+  if (source === 'sub2api_billing') return t('admin.accounts.upstreamBilling.sub2apiBilling')
+  return ''
+})
+const balanceValue = computed(() => {
+  const billing = data.value
+  if (!billing) return null
+  const raw = billing.balance ?? billing.upstream_balance
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : null
+})
+const balanceUnit = computed(() => data.value?.unit || data.value?.upstream_balance_unit || '')
+const balanceText = computed(() => {
+  if (balanceValue.value == null) return '-'
+  const value = balanceValue.value.toLocaleString(undefined, { maximumFractionDigits: 4 })
+  return balanceUnit.value ? `${value} ${balanceUnit.value}` : value
+})
+const balanceLow = computed(() => balanceValue.value != null && balanceValue.value <= 0)
+const balanceError = computed(() => data.value?.balance_error || data.value?.upstream_balance_error || '')
 const elapsedSinceLastSuccess = computed(() => {
   if (!Number.isFinite(receivedAt.value)) return '-'
   const elapsedMinutes = Math.max(0, Math.floor((props.now - receivedAt.value) / 60_000))

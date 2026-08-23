@@ -246,11 +246,38 @@ func TestShuaiAPIUsageURLAndResponseParsing(t *testing.T) {
 	require.Equal(t, 12.5, data["balance"])
 	require.Equal(t, 0.5, data["effective_rate_multiplier"])
 	require.Equal(t, "USD", data["unit"])
+	require.Equal(t, "token", data["billing_scope"])
+	require.Equal(t, 0.5, data["resolved_rate_multiplier"])
+	require.Equal(t, 0.5, data["group_rate_multiplier"])
+	require.Equal(t, false, data["peak_rate_enabled"])
 
 	data, err = parseShuaiAPIUsageResponse([]byte(`{"code":true,"data":{"object":"token_usage","total_available":500000,"rate":0.25}}`))
 	require.NoError(t, err)
 	require.Equal(t, 1.0, data["balance"])
 	require.Equal(t, 0.25, data["effective_rate_multiplier"])
+	require.Equal(t, "token", data["billing_scope"])
+	require.Equal(t, 0.25, data["resolved_rate_multiplier"])
+}
+
+func TestShuaiAPIUsageSyncRateRejectsZero(t *testing.T) {
+	_, ok := shuaiAPIUsageSyncRate(map[string]any{"effective_rate_multiplier": 0.0})
+	require.False(t, ok)
+}
+
+func TestUpstreamUsageBalanceParsing(t *testing.T) {
+	balance, unit, balanceType, ok := parseUpstreamUsageBalance([]byte(`{"mode":"quota_limited","quota":{"remaining":5.25},"unit":"USD","isValid":true}`))
+	require.True(t, ok)
+	require.Equal(t, 5.25, balance)
+	require.Equal(t, "USD", unit)
+	require.Equal(t, "quota_remaining", balanceType)
+}
+
+func TestUpstreamOpenAIBillingParsing(t *testing.T) {
+	limit, ok := parseUpstreamOpenAIBilling([]byte(`{"hard_limit_usd":12.5}`))
+	require.True(t, ok)
+	require.Equal(t, 12.5, limit)
+	_, ok = parseUpstreamOpenAIBilling([]byte(`{"hard_limit_usd":1000001}`))
+	require.False(t, ok)
 }
 
 func TestShuaiAPIUsageInvalidRateDoesNotInvalidateBalance(t *testing.T) {
@@ -370,10 +397,10 @@ func TestUpstreamBillingProbeSuccessPersistsSanitizedSnapshot(t *testing.T) {
 	require.Equal(t, 0.6, *account.RateMultiplier)
 	require.NotNil(t, snapshot.SyncedRateMultiplier)
 	require.Equal(t, 0.6, *snapshot.SyncedRateMultiplier)
-	require.Equal(t, "https://upstream.example/v1/sub2api/billing", upstream.lastReq.URL.String())
-	require.Equal(t, http.MethodGet, upstream.lastReq.Method)
-	require.Equal(t, "Bearer sk-sensitive", upstream.lastReq.Header.Get("Authorization"))
-	require.True(t, HTTPUpstreamRedirectsDisabled(upstream.lastReq.Context()))
+	require.Equal(t, "https://upstream.example/v1/sub2api/billing", upstream.requests[0].URL.String())
+	require.Equal(t, http.MethodGet, upstream.requests[0].Method)
+	require.Equal(t, "Bearer sk-sensitive", upstream.requests[0].Header.Get("Authorization"))
+	require.True(t, HTTPUpstreamRedirectsDisabled(upstream.requests[0].Context()))
 
 	persisted := decodeUpstreamBillingProbeSnapshot(account.Extra)
 	require.NotNil(t, persisted)
@@ -409,7 +436,7 @@ func TestUpstreamBillingProbeAdaptiveCNUsesChatProtocolBaseURL(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, UpstreamBillingProbeStatusOK, snapshot.Status)
-	require.Equal(t, "https://chat-relay.example/v1/sub2api/billing", upstream.lastReq.URL.String())
+	require.Equal(t, "https://chat-relay.example/v1/sub2api/billing", upstream.requests[0].URL.String())
 }
 
 func TestUpstreamBillingProbeSyncsResolvedRateForAllAPIKeyPlatforms(t *testing.T) {

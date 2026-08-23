@@ -520,23 +520,33 @@ func (r *accountRepository) updateLockedAccount(
 	if err != nil {
 		return nil, err
 	}
+	rateSyncWasEnabled := accountRateSyncEnabledInExtra(account.Extra)
 	account.Extra = extra
-	if explicitRateMultiplier != nil && !accountRateSyncEnabledInExtra(extra) {
+	rateSyncWillBeEnabled := accountRateSyncEnabledInExtra(extra)
+	if rateSyncWillBeEnabled && !rateSyncWasEnabled {
+		if _, exists := extra[service.ManualRateMultiplierExtraKey]; !exists {
+			rate := 1.0
+			if account.RateMultiplier != nil && *account.RateMultiplier >= 0 &&
+				!math.IsNaN(*account.RateMultiplier) && !math.IsInf(*account.RateMultiplier, 0) {
+				rate = *account.RateMultiplier
+			}
+			extra[service.ManualRateMultiplierExtraKey] = rate
+		}
+	}
+	if explicitRateMultiplier != nil && !rateSyncWillBeEnabled {
 		extra[service.ManualRateMultiplierExtraKey] = *explicitRateMultiplier
 	}
 
 	// Once upstream ownership is disabled, the administrator-owned multiplier
-	// becomes authoritative again. This must happen in the same transaction as
-	// the extra flags, otherwise billing can keep using the last upstream value.
+	// becomes authoritative again when a backup exists. Without a backup, keep
+	// the current value instead of forcing a 1.0 default over a manual setting.
 	restoreManualRate := (explicitRateSyncEnabled != nil && !*explicitRateSyncEnabled) ||
 		(explicitProbeEnabled != nil && !*explicitProbeEnabled)
 	if explicitRateMultiplier == nil && restoreManualRate {
-		rate := 1.0
 		if saved, ok := accountManualRateMultiplierFromExtra(extra); ok {
-			rate = saved
+			account.RateMultiplier = &saved
+			explicitRateMultiplier = &saved
 		}
-		account.RateMultiplier = &rate
-		explicitRateMultiplier = &rate
 	}
 
 	schedulable := account.Schedulable
@@ -660,6 +670,7 @@ func lockAndMergeAccountProbeExtra(
 			extra -> 'ollama_cloud_usage_session',
 			extra -> 'ollama_cloud_usage_auto_refresh',
 			extra -> 'ollama_cloud_usage_snapshot'
+			,COALESCE(extra, '{}'::jsonb)
 		FROM accounts
 		WHERE id = $1 AND deleted_at IS NULL
 		FOR NO KEY UPDATE
@@ -685,6 +696,7 @@ func lockAndMergeAccountProbeExtra(
 		currentOllamaSession         []byte
 		currentOllamaAutoRefresh     []byte
 		currentOllamaSnapshot        []byte
+		currentExtra                 []byte
 	)
 	if err := rows.Scan(
 		&identityUnchanged,
@@ -696,6 +708,7 @@ func lockAndMergeAccountProbeExtra(
 		&currentOllamaSession,
 		&currentOllamaAutoRefresh,
 		&currentOllamaSnapshot,
+		&currentExtra,
 	); err != nil {
 		return nil, err
 	}
@@ -713,6 +726,17 @@ func lockAndMergeAccountProbeExtra(
 		service.OllamaCloudUsageSnapshotExtraKey,
 	} {
 		delete(extra, key)
+	}
+	currentExtraMap := map[string]any{}
+	if dbExtra, ok, err := decodeAccountExtraJSON(currentExtra); err != nil {
+		return nil, err
+	} else if ok {
+		if mapped, isMap := dbExtra.(map[string]any); isMap {
+			currentExtraMap = mapped
+		}
+	}
+	if value, exists := currentExtraMap[service.ManualRateMultiplierExtraKey]; exists {
+		extra[service.ManualRateMultiplierExtraKey] = value
 	}
 	probeAccount := service.IsUpstreamBillingProbeIdentity(account.Platform, account.Type)
 	probeEnabled := false
@@ -768,7 +792,26 @@ func lockAndMergeAccountProbeExtra(
 			extra[service.UpstreamBillingProbeExtraKey] = snapshot
 		}
 	}
-
+	preserveUpstreamMetadata := identityUnchanged && !probeExplicitlyDisabled &&
+		!(explicitRateSyncEnabled != nil && !*explicitRateSyncEnabled)
+	if preserveUpstreamMetadata {
+		for _, key := range []string{
+			service.UpstreamBillingProviderExtraKey,
+			service.UpstreamRateMultiplierExtraKey,
+			service.UpstreamRateSourceExtraKey,
+			service.UpstreamRateObservedAtExtraKey,
+			service.UpstreamBalanceExtraKey,
+			service.UpstreamBalanceUnitExtraKey,
+			service.UpstreamBalanceTypeExtraKey,
+			service.UpstreamBalanceSourceExtraKey,
+			service.UpstreamBalanceObservedAtExtraKey,
+			service.UpstreamBalanceErrorExtraKey,
+		} {
+			if value, exists := currentExtraMap[key]; exists {
+				extra[key] = value
+			}
+		}
+	}
 	if service.IsOllamaCloudUsageAccount(account) && ollamaGroupIdentityUnchanged {
 		for key, raw := range map[string][]byte{
 			service.OllamaCloudUsageSessionExtraKey:     currentOllamaSession,
@@ -797,6 +840,12 @@ func lockAndMergeAccountProbeExtra(
 		delete(extra, service.UpstreamRateSourceExtraKey)
 		delete(extra, service.UpstreamRateObservedAtExtraKey)
 		delete(extra, service.UpstreamBillingProviderExtraKey)
+		delete(extra, service.UpstreamBalanceExtraKey)
+		delete(extra, service.UpstreamBalanceUnitExtraKey)
+		delete(extra, service.UpstreamBalanceTypeExtraKey)
+		delete(extra, service.UpstreamBalanceSourceExtraKey)
+		delete(extra, service.UpstreamBalanceObservedAtExtraKey)
+		delete(extra, service.UpstreamBalanceErrorExtraKey)
 	}
 	return extra, nil
 }
@@ -2715,6 +2764,24 @@ func (r *accountRepository) updateUpstreamBillingProbeSnapshotInTx(
 		if observedAt, ok := snapshot.Data[service.UpstreamRateObservedAtExtraKey].(string); ok && observedAt != "" {
 			extraPayload[service.UpstreamRateObservedAtExtraKey] = observedAt
 		}
+		if balance, ok := snapshot.Data[service.UpstreamBalanceExtraKey].(float64); ok {
+			extraPayload[service.UpstreamBalanceExtraKey] = balance
+		}
+		if unit, ok := snapshot.Data[service.UpstreamBalanceUnitExtraKey].(string); ok && unit != "" {
+			extraPayload[service.UpstreamBalanceUnitExtraKey] = unit
+		}
+		if balanceType, ok := snapshot.Data[service.UpstreamBalanceTypeExtraKey].(string); ok && balanceType != "" {
+			extraPayload[service.UpstreamBalanceTypeExtraKey] = balanceType
+		}
+		if source, ok := snapshot.Data[service.UpstreamBalanceSourceExtraKey].(string); ok && source != "" {
+			extraPayload[service.UpstreamBalanceSourceExtraKey] = source
+		}
+		if observedAt, ok := snapshot.Data[service.UpstreamBalanceObservedAtExtraKey].(string); ok && observedAt != "" {
+			extraPayload[service.UpstreamBalanceObservedAtExtraKey] = observedAt
+		}
+		if balanceErr, ok := snapshot.Data[service.UpstreamBalanceErrorExtraKey].(string); ok && balanceErr != "" {
+			extraPayload[service.UpstreamBalanceErrorExtraKey] = balanceErr
+		}
 	}
 	payload, err := json.Marshal(extraPayload)
 	if err != nil {
@@ -2967,6 +3034,7 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 		args = append(args, *updates.RateMultiplier)
 		idx++
 	}
+	restoreBulkManualRate := updates.ProbeEnabled != nil && !*updates.ProbeEnabled && updates.RateMultiplier == nil
 	if updates.LoadFactor != nil {
 		if *updates.LoadFactor <= 0 {
 			setClauses = append(setClauses, "load_factor = NULL")
@@ -3027,6 +3095,7 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 			idx++
 			if upstreamBillingProbeExplicitlyDisabled(updates.Extra) || upstreamBillingProbeSnapshotClearRequested(updates.Extra) {
 				extraExpression = "(" + extraExpression + ") - 'upstream_billing_probe'"
+				extraExpression = "(" + extraExpression + ") - 'upstream_billing_provider' - 'upstream_rate_multiplier' - 'upstream_rate_source' - 'upstream_rate_observed_at' - 'upstream_balance' - 'upstream_balance_unit' - 'upstream_balance_type' - 'upstream_balance_source' - 'upstream_balance_observed_at' - 'upstream_balance_error'"
 			}
 			if ollamaCloudUsageSnapshotClearRequested(updates.Extra) {
 				extraExpression = "(" + extraExpression + ") - 'ollama_cloud_usage_snapshot'"
@@ -3058,6 +3127,9 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 			extraExpression = ensureCodexFingerprintSeedSQL(extraExpression)
 		}
 		setClauses = append(setClauses, "extra = "+extraExpression)
+	}
+	if restoreBulkManualRate {
+		setClauses = append(setClauses, "rate_multiplier = CASE WHEN COALESCE(extra, '{}'::jsonb) ? 'manual_rate_multiplier' THEN (COALESCE(extra, '{}'::jsonb) ->> 'manual_rate_multiplier')::numeric ELSE rate_multiplier END")
 	}
 
 	if len(setClauses) == 0 {
