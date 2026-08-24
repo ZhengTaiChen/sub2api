@@ -24,12 +24,21 @@ type UserHandler struct {
 	emailCache            service.EmailCache
 	affiliateService      *service.AffiliateService
 	userPlatformQuotaRepo service.UserPlatformQuotaRepository
-	apiKeyService         *service.APIKeyService
-	accountService        *service.AccountService
+	apiKeyService         userUpstreamGroupProvider
+	accountService        userUpstreamAccountLister
+}
+
+// Keep this endpoint dependent on the two read-only operations it needs.
+type userUpstreamGroupProvider interface {
+	GetAvailableGroups(context.Context, int64) ([]service.Group, error)
+}
+
+type userUpstreamAccountLister interface {
+	ListByGroup(context.Context, int64) ([]service.Account, error)
 }
 
 // SetUpstreamBillingDependencies wires optional user-facing upstream billing support.
-func (h *UserHandler) SetUpstreamBillingDependencies(apiKeyService *service.APIKeyService, accountService *service.AccountService) {
+func (h *UserHandler) SetUpstreamBillingDependencies(apiKeyService userUpstreamGroupProvider, accountService userUpstreamAccountLister) {
 	h.apiKeyService = apiKeyService
 	h.accountService = accountService
 }
@@ -84,14 +93,18 @@ type userUpstreamBillingAccount struct {
 	AccountID      int64    `json:"account_id"`
 	Name           string   `json:"name"`
 	Platform       string   `json:"platform"`
-	RateMultiplier *float64 `json:"rate_multiplier,omitempty"`
-	Balance        *float64 `json:"balance,omitempty"`
-	Unit           string   `json:"unit,omitempty"`
-	BalanceType    string   `json:"balance_type,omitempty"`
-	BalanceSource  string   `json:"balance_source,omitempty"`
-	BalanceError   string   `json:"balance_error,omitempty"`
-	ObservedAt     string   `json:"observed_at,omitempty"`
-	UpdatedAt      string   `json:"updated_at,omitempty"`
+	Provider       string   `json:"provider"`
+	RateMultiplier *float64 `json:"rate_multiplier"`
+	RateStatus     string   `json:"rate_status"`
+	RateError      string   `json:"rate_error"`
+	Balance        *float64 `json:"balance"`
+	Unit           string   `json:"unit"`
+	BalanceType    string   `json:"balance_type"`
+	BalanceSource  string   `json:"balance_source"`
+	BalanceStatus  string   `json:"balance_status"`
+	BalanceError   string   `json:"balance_error"`
+	ObservedAt     string   `json:"observed_at"`
+	UpdatedAt      string   `json:"updated_at"`
 }
 
 func userUpstreamBillingFloat(data map[string]any, key string) *float64 {
@@ -132,17 +145,123 @@ func userUpstreamBillingString(data map[string]any, key string) string {
 	return strings.TrimSpace(value)
 }
 
+func userUpstreamBillingBool(data map[string]any, key string) bool {
+	value, ok := data[key]
+	if !ok {
+		return false
+	}
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(v))
+		return err == nil && parsed
+	default:
+		return false
+	}
+}
+
+func userUpstreamBillingTime(data map[string]any, key string) string {
+	if data == nil {
+		return ""
+	}
+	if value, ok := data[key].(time.Time); ok {
+		return value.UTC().Format(time.RFC3339Nano)
+	}
+	return userUpstreamBillingString(data, key)
+}
+
+func userUpstreamBillingUpdatedAt(account service.Account, snapshot map[string]any) string {
+	if !account.UpdatedAt.IsZero() {
+		return account.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	if updatedAt := userUpstreamBillingTime(snapshot, "updated_at"); updatedAt != "" {
+		return updatedAt
+	}
+	return userUpstreamBillingTime(snapshot, "received_at")
+}
+
+func userUpstreamBillingStatus(snapshot, data map[string]any, key string) string {
+	if status := userUpstreamBillingString(snapshot, key); status != "" {
+		return status
+	}
+	return userUpstreamBillingString(data, key)
+}
+
+func userUpstreamBillingHasRateData(data map[string]any) bool {
+	for _, key := range []string{
+		service.UpstreamRateMultiplierExtraKey,
+		"resolved_rate_multiplier",
+		"effective_rate_multiplier",
+		"rate_multiplier",
+	} {
+		if userUpstreamBillingFloat(data, key) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func userUpstreamBillingProvider(account service.Account, snapshot, data map[string]any) string {
+	normalize := func(value string) string {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case service.UpstreamProviderSub2API, service.UpstreamProviderNewAPI,
+			service.UpstreamProviderShuai, service.UpstreamProviderOpenCode,
+			service.UpstreamProviderCustom:
+			return strings.ToLower(strings.TrimSpace(value))
+		default:
+			return ""
+		}
+	}
+	if provider := userUpstreamBillingString(account.Extra, "upstream_provider"); provider != "" && !strings.EqualFold(provider, service.UpstreamProviderAuto) {
+		if normalized := normalize(provider); normalized != "" {
+			return normalized
+		}
+	}
+	if provider := userUpstreamBillingString(account.Credentials, "provider"); provider != "" && !strings.EqualFold(provider, service.UpstreamProviderAuto) {
+		if normalized := normalize(provider); normalized != "" {
+			return normalized
+		}
+	}
+	for _, source := range []map[string]any{snapshot, data, account.Extra} {
+		for _, key := range []string{service.UpstreamBillingProviderExtraKey, "provider"} {
+			if provider := userUpstreamBillingString(source, key); provider != "" && !strings.EqualFold(provider, service.UpstreamProviderAuto) {
+				if normalized := normalize(provider); normalized != "" {
+					return normalized
+				}
+			}
+		}
+	}
+	rateSource := userUpstreamBillingString(data, service.UpstreamRateSourceExtraKey)
+	if strings.Contains(rateSource, "shuai") {
+		return "shuai_api"
+	}
+	if strings.Contains(rateSource, "sub2api") {
+		return "sub2api"
+	}
+	return "custom"
+}
+
+func userUpstreamBillingHasGroup(groupIDs []int64, groupID int64) bool {
+	for _, candidate := range groupIDs {
+		if candidate == groupID {
+			return true
+		}
+	}
+	return false
+}
+
 // GetUpstreamBilling returns upstream rate and balance snapshots for accounts
 // bound to groups the current user can access.
 // GET /api/v1/user/upstream-billing
 func (h *UserHandler) GetUpstreamBilling(c *gin.Context) {
-	if h.apiKeyService == nil || h.accountService == nil {
-		response.Success(c, map[string]any{"upstream_billing": []userUpstreamBillingAccount{}})
-		return
-	}
 	subject, ok := middleware2.GetAuthSubjectFromContext(c)
 	if !ok {
 		response.Unauthorized(c, "User not authenticated")
+		return
+	}
+	if h.apiKeyService == nil || h.accountService == nil {
+		response.Success(c, map[string]any{"upstream_billing": []userUpstreamBillingAccount{}})
 		return
 	}
 	groups, err := h.apiKeyService.GetAvailableGroups(c.Request.Context(), subject.UserID)
@@ -160,27 +279,62 @@ func (h *UserHandler) GetUpstreamBilling(c *gin.Context) {
 		}
 		for i := range accounts {
 			account := &accounts[i]
+			if !account.IsActive() || !userUpstreamBillingBool(account.Extra, service.UpstreamBillingProbeEnabledExtraKey) {
+				continue
+			}
+			if !userUpstreamBillingHasGroup(account.GroupIDs, group.ID) {
+				continue
+			}
 			if _, exists := seen[account.ID]; exists {
 				continue
 			}
 			seen[account.ID] = struct{}{}
 			snapshot, ok := account.Extra[service.UpstreamBillingProbeExtraKey].(map[string]any)
 			if !ok {
-				continue
+				snapshot = nil
 			}
 			data, _ := snapshot["data"].(map[string]any)
+			rateStatus := userUpstreamBillingStatus(snapshot, data, "rate_status")
+			rateError := userUpstreamBillingString(snapshot, "rate_error")
+			if rateError == "" {
+				rateError = userUpstreamBillingString(data, "rate_error")
+			}
+			balanceStatus := userUpstreamBillingStatus(snapshot, data, "balance_status")
+			balanceError := userUpstreamBillingString(snapshot, "balance_error")
+			if balanceError == "" {
+				balanceError = userUpstreamBillingString(data, service.UpstreamBalanceErrorExtraKey)
+			}
+			if rateStatus == "" && snapshot != nil && userUpstreamBillingString(snapshot, "status") == service.UpstreamBillingProbeStatusOK && userUpstreamBillingHasRateData(data) {
+				rateStatus = service.UpstreamBillingProbeStatusOK
+			}
+			if balanceStatus == "" {
+				if userUpstreamBillingFloat(data, service.UpstreamBalanceExtraKey) != nil {
+					balanceStatus = service.UpstreamBillingProbeStatusOK
+				} else if balanceError != "" {
+					balanceStatus = service.UpstreamBillingProbeStatusFailed
+				} else {
+					balanceStatus = "unknown"
+				}
+			}
+			if rateStatus == "" {
+				rateStatus = "unknown"
+			}
 			item := userUpstreamBillingAccount{
 				AccountID:      account.ID,
 				Name:           account.Name,
 				Platform:       account.Platform,
+				Provider:       userUpstreamBillingProvider(*account, snapshot, data),
 				RateMultiplier: account.RateMultiplier,
+				RateStatus:     rateStatus,
+				RateError:      rateError,
 				Balance:        userUpstreamBillingFloat(data, service.UpstreamBalanceExtraKey),
 				Unit:           userUpstreamBillingString(data, service.UpstreamBalanceUnitExtraKey),
 				BalanceType:    userUpstreamBillingString(data, service.UpstreamBalanceTypeExtraKey),
 				BalanceSource:  userUpstreamBillingString(data, service.UpstreamBalanceSourceExtraKey),
-				BalanceError:   userUpstreamBillingString(data, service.UpstreamBalanceErrorExtraKey),
-				ObservedAt:     userUpstreamBillingString(data, service.UpstreamBalanceObservedAtExtraKey),
-				UpdatedAt:      userUpstreamBillingString(snapshot, "received_at"),
+				BalanceStatus:  balanceStatus,
+				BalanceError:   balanceError,
+				ObservedAt:     userUpstreamBillingTime(data, service.UpstreamBalanceObservedAtExtraKey),
+				UpdatedAt:      userUpstreamBillingUpdatedAt(*account, snapshot),
 			}
 			out = append(out, item)
 		}

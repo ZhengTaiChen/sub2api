@@ -27,6 +27,7 @@ import (
 func f64p(v float64) *float64 { return &v }
 
 type httpUpstreamRecorder struct {
+	mu           sync.Mutex
 	lastReq      *http.Request
 	lastBody     []byte
 	lastProxyURL string
@@ -36,6 +37,42 @@ type httpUpstreamRecorder struct {
 	resp      *http.Response
 	responses []*http.Response
 	err       error
+	respUsed  bool
+	respCache *httpUpstreamResponseCache
+}
+
+type httpUpstreamResponseCache struct {
+	mu    sync.Mutex
+	body  []byte
+	ready bool
+}
+
+type httpUpstreamRecordingBody struct {
+	cache *httpUpstreamResponseCache
+	body  io.ReadCloser
+}
+
+func (r *httpUpstreamRecordingBody) Read(p []byte) (int, error) {
+	n, err := r.body.Read(p)
+	if n > 0 {
+		r.cache.mu.Lock()
+		r.cache.body = append(r.cache.body, p[:n]...)
+		r.cache.mu.Unlock()
+	}
+	if err != nil {
+		r.cache.mu.Lock()
+		r.cache.ready = true
+		r.cache.mu.Unlock()
+	}
+	return n, err
+}
+
+func (r *httpUpstreamRecordingBody) Close() error {
+	err := r.body.Close()
+	r.cache.mu.Lock()
+	r.cache.ready = true
+	r.cache.mu.Unlock()
+	return err
 }
 
 type passthroughErrReadCloser struct {
@@ -64,6 +101,7 @@ func (r passthroughErrReadCloser) Close() error {
 }
 
 func (u *httpUpstreamRecorder) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
+	u.mu.Lock()
 	u.lastReq = req
 	u.lastProxyURL = proxyURL
 	if req != nil && req.Body != nil {
@@ -75,14 +113,47 @@ func (u *httpUpstreamRecorder) Do(req *http.Request, proxyURL string, accountID 
 	}
 	u.requests = append(u.requests, req)
 	if u.err != nil {
+		u.mu.Unlock()
 		return nil, u.err
 	}
 	if len(u.responses) > 0 {
 		resp := u.responses[0]
 		u.responses = u.responses[1:]
+		u.mu.Unlock()
 		return resp, nil
 	}
-	return u.resp, nil
+	if u.resp == nil {
+		u.mu.Unlock()
+		return nil, nil
+	}
+	if !u.respUsed {
+		u.respUsed = true
+		resp := *u.resp
+		if u.resp.Header != nil {
+			resp.Header = u.resp.Header.Clone()
+		}
+		if u.resp.Body != nil {
+			u.respCache = &httpUpstreamResponseCache{}
+			resp.Body = &httpUpstreamRecordingBody{cache: u.respCache, body: u.resp.Body}
+		}
+		u.mu.Unlock()
+		return &resp, nil
+	}
+	if u.respCache != nil {
+		u.respCache.mu.Lock()
+		body := append([]byte(nil), u.respCache.body...)
+		u.respCache.mu.Unlock()
+		resp := *u.resp
+		if u.resp.Header != nil {
+			resp.Header = u.resp.Header.Clone()
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		u.mu.Unlock()
+		return &resp, nil
+	}
+	resp := *u.resp
+	u.mu.Unlock()
+	return &resp, nil
 }
 
 func (u *httpUpstreamRecorder) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, profile *tlsfingerprint.Profile) (*http.Response, error) {

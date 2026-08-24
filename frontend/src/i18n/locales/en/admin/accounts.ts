@@ -286,6 +286,18 @@ export default {
         rateSource: 'Rate source: {value}',
         balance: 'Balance: {value}',
         balanceUnknown: 'Balance: unknown',
+        balanceLow: 'Low balance',
+        balanceExpired: 'Balance expired',
+        provider: 'Upstream provider',
+        providerHint: 'Select the upstream rate and balance adapter; automatic mode identifies it from responses.',
+        providers: {
+          auto: 'Auto-detect',
+          sub2api: 'Sub2API',
+          newApi: 'new-api',
+          shuaiApi: 'Shuai API',
+          opencode: 'OpenCode',
+          custom: 'Custom upstream'
+        },
         shuaiApiUsage: 'Shuai API upstream',
         sub2apiBilling: 'Sub2API upstream',
         nextProbeAt: 'Next probe: {value}',

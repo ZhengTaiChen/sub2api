@@ -218,11 +218,29 @@ func ProvideHandlers(
 	}
 }
 
+// ProvideUserHandler wires the read-only upstream billing dependencies used by
+// the user dashboard. Keeping this in the provider graph ensures regenerated
+// Wire output preserves the production endpoint behavior.
+func ProvideUserHandler(
+	userService *service.UserService,
+	authService *service.AuthService,
+	emailService *service.EmailService,
+	emailCache service.EmailCache,
+	affiliateService *service.AffiliateService,
+	userPlatformQuotaRepo service.UserPlatformQuotaRepository,
+	apiKeyService *service.APIKeyService,
+	accountService *service.AccountService,
+) *UserHandler {
+	h := NewUserHandler(userService, authService, emailService, emailCache, affiliateService, userPlatformQuotaRepo)
+	h.SetUpstreamBillingDependencies(apiKeyService, accountService)
+	return h
+}
+
 // ProviderSet is the Wire provider set for all handlers
 var ProviderSet = wire.NewSet(
 	// Top-level handlers
 	NewAuthHandler,
-	NewUserHandler,
+	ProvideUserHandler,
 	NewAPIKeyHandler,
 	NewUsageHandler,
 	NewRedeemHandler,

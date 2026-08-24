@@ -32,6 +32,7 @@ const (
 	UpstreamBillingProbeExtraKey           = "upstream_billing_probe"
 	UpstreamBillingProbeEnabledExtraKey    = "upstream_billing_probe_enabled"
 	UpstreamBillingRateSyncEnabledExtraKey = "upstream_billing_rate_sync_enabled"
+	UpstreamProviderExtraKey               = "upstream_provider"
 	UpstreamBillingProviderExtraKey        = "upstream_billing_provider"
 	UpstreamRateMultiplierExtraKey         = "upstream_rate_multiplier"
 	UpstreamRateSourceExtraKey             = "upstream_rate_source"
@@ -109,6 +110,15 @@ const (
 	UpstreamBillingProbeStatusFailed      = "failed"
 )
 
+const (
+	UpstreamProviderAuto     = "auto"
+	UpstreamProviderSub2API  = "sub2api"
+	UpstreamProviderNewAPI   = "new_api"
+	UpstreamProviderShuai    = "shuai_api"
+	UpstreamProviderOpenCode = "opencode"
+	UpstreamProviderCustom   = "custom"
+)
+
 // UpstreamBillingProbeSettings controls the periodic probe runner.
 type UpstreamBillingProbeSettings struct {
 	Enabled         bool `json:"enabled"`
@@ -119,6 +129,11 @@ type UpstreamBillingProbeSettings struct {
 // a sanitized map so future response fields do not require a database change.
 type UpstreamBillingProbeSnapshot struct {
 	Status        string         `json:"status"`
+	Provider      string         `json:"provider,omitempty"`
+	RateStatus    string         `json:"rate_status,omitempty"`
+	RateError     string         `json:"rate_error,omitempty"`
+	BalanceStatus string         `json:"balance_status,omitempty"`
+	BalanceError  string         `json:"balance_error,omitempty"`
 	Data          map[string]any `json:"data,omitempty"`
 	ReceivedAt    *time.Time     `json:"received_at,omitempty"`
 	FreshUntil    *time.Time     `json:"fresh_until,omitempty"`
@@ -627,16 +642,16 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		baseURL = account.GetCNProtocolBaseURL(APIProtocolChatCompletions)
 	}
 	shuaiAPI := isShuaiAPIAccount(account, baseURL)
+	officialAPI := account.Platform != PlatformOpenAI && !shuaiAPI && upstreamBillingProbeTargetIsOfficialAPI(baseURL)
 	if account.Platform == PlatformOpenAI && !shuaiAPI {
 		if baseURL == "" {
 			// 保持官方语义：OpenAI 账号无自定义 base 时探官方域（404 → unsupported）。
 			baseURL = "https://api.openai.com"
 		}
-	} else if !shuaiAPI && upstreamBillingProbeTargetIsOfficialAPI(baseURL) {
-		// 其他平台 base_url 为空或指向官方 API 根域（前端创建时会把空值
-		// 填成官方默认域，且提供 us-east-1.api.x.ai 等官方区域预设）⇒
-		// 必无 /v1/sub2api/billing；不发请求，直接记 unsupported，避免
-		// 拿账号 Key 周期性请求官方域的不存在路径。
+	}
+	if officialAPI {
+		// Non-OpenAI official endpoints do not expose the relay billing contract.
+		// Skip both probes so an API key is never sent to a known unsupported path.
 		return s.persistProbeFailure(ctx, account, intervalMinutes, now, 0, "unsupported", 0)
 	}
 	normalizedBaseURL, err := s.accountTestService.validateUpstreamBaseURL(baseURL)
@@ -653,128 +668,82 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		}
 		proxyURL = account.Proxy.URL()
 	}
-	probeURL := buildOpenAIEndpointURL(normalizedBaseURL, "/v1/sub2api/billing")
-	if shuaiAPI {
-		probeURL = buildShuaiUsageURL(normalizedBaseURL)
-	}
-	probeTimeout := upstreamBillingProbeRequestTimeout
-	if shuaiAPI {
-		probeTimeout = upstreamBillingShuaiRequestTimeout
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, bytes.NewReader(nil))
-	if err != nil {
-		return s.persistProbeFailure(ctx, account, intervalMinutes, now, 0, "request_build_failed", 0)
-	}
-	// OpenAI 账号保持官方 openai 传输画像；其他平台探测走默认画像。
-	profile := HTTPUpstreamProfileDefault
-	if account.Platform == PlatformOpenAI {
-		profile = HTTPUpstreamProfileOpenAI
-	}
-	reqCtx := WithHTTPUpstreamProfile(req.Context(), profile)
-	req = req.WithContext(WithHTTPUpstreamRedirectsDisabled(reqCtx))
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	if shuaiAPI {
-		req.Header.Set("User-Agent", "cc-switch/1.0")
-	}
-	account.ApplyHeaderOverrides(req.Header)
 	var tlsProfile *tlsfingerprint.Profile
 	if s.accountTestService.tlsFPProfileService != nil {
 		tlsProfile = s.accountTestService.tlsFPProfileService.ResolveTLSProfile(account)
 	}
-	resp, err := s.accountTestService.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
-	if err != nil {
-		return s.persistProbeFailure(ctx, account, intervalMinutes, now, 0, "request_failed", 0)
+	rateData, rateStatus, rateError, rateHTTPStatus, rateRetry := s.probeRateForAccount(ctx, account, normalizedBaseURL, proxyURL, tlsProfile, shuaiAPI, officialAPI, now)
+	// Rate support is provider-specific, but balance support is intentionally
+	// independent: official OpenAI-compatible endpoints may still expose
+	// /v1/usage or dashboard billing.
+	balanceData, balanceStatus, balanceError := s.probeBalanceForAccount(ctx, account, normalizedBaseURL, proxyURL, tlsProfile, now, shuaiAPI, rateData)
+
+	previous := decodeUpstreamBillingProbeSnapshot(account.Extra)
+	data := cloneUpstreamBillingData(previousData(previous))
+	for key, value := range rateData {
+		data[key] = value
 	}
-	if resp == nil || resp.Body == nil {
-		return s.persistProbeFailure(ctx, account, intervalMinutes, now, 0, "empty_response", 0)
+	for key, value := range balanceData {
+		data[key] = value
 	}
-	defer func() { _ = resp.Body.Close() }()
-	maxBodyBytes := upstreamBillingProbeMaxBodyBytes
-	if shuaiAPI {
-		maxBodyBytes = upstreamBillingShuaiMaxBodyBytes
+	if balanceStatus == UpstreamBillingProbeStatusOK {
+		delete(data, UpstreamBalanceErrorExtraKey)
 	}
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(maxBodyBytes)+1))
-	if readErr != nil {
-		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "response_read_failed", retryAfter(resp.Header, now))
-	}
-	if len(body) > maxBodyBytes {
-		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "response_too_large", retryAfter(resp.Header, now))
-	}
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
-		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "unsupported", retryAfter(resp.Header, now))
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "http_error", retryAfter(resp.Header, now))
-	}
-	var data map[string]any
-	if shuaiAPI {
-		data, err = parseShuaiAPIUsageResponse(body)
-	} else {
-		data, err = parseUpstreamBillingProbeResponse(body)
-	}
-	if err != nil {
-		return s.persistProbeFailure(ctx, account, intervalMinutes, now, resp.StatusCode, "invalid_response", retryAfter(resp.Header, now))
-	}
+	provider := resolveUpstreamProvider(account, normalizedBaseURL, shuaiAPI, rateStatus, balanceStatus, data)
+
+	topStatus := aggregateUpstreamProbeStatus(rateStatus, balanceStatus)
 	snapshot := &UpstreamBillingProbeSnapshot{
-		Status:        UpstreamBillingProbeStatusOK,
+		Status:        topStatus,
+		Provider:      provider,
+		RateStatus:    rateStatus,
+		RateError:     rateError,
+		BalanceStatus: balanceStatus,
+		BalanceError:  balanceError,
 		Data:          data,
 		ReceivedAt:    probeTimePtr(now),
 		FreshUntil:    probeTimePtr(now.Add(2 * time.Duration(intervalMinutes) * time.Minute)),
 		LastAttemptAt: now,
-		NextProbeAt:   now.Add(nextProbeDelay(intervalMinutes, 0)),
-		HTTPStatus:    resp.StatusCode,
+		NextProbeAt:   now.Add(nextProbeDelay(intervalMinutes, rateRetry)),
+		HTTPStatus:    rateHTTPStatus,
 	}
 	if shuaiAPI {
 		snapshot.FreshUntil = probeTimePtr(now.Add(upstreamBillingShuaiFreshTTL))
-		snapshot.Data["rate_source"] = "shuai_api_usage"
-		snapshot.Data["checked_at"] = now.UTC().Format(time.RFC3339Nano)
-		if _, ok := snapshot.Data[UpstreamBalanceExtraKey]; ok {
-			snapshot.Data[UpstreamBalanceSourceExtraKey] = "shuai_api_usage"
-			snapshot.Data[UpstreamBalanceObservedAtExtraKey] = upstreamBillingBalanceObservedAt(now)
-			if _, ok := snapshot.Data[UpstreamBalanceTypeExtraKey]; !ok {
-				snapshot.Data[UpstreamBalanceTypeExtraKey] = "quota_remaining"
-			}
+	}
+	if topStatus == UpstreamBillingProbeStatusUnsupported {
+		snapshot.LastError = "unsupported"
+	} else if topStatus == UpstreamBillingProbeStatusFailed {
+		// A successful capability makes the overall probe successful. Do not
+		// surface the other capability's failure as a top-level failure.
+		if rateStatus == UpstreamBillingProbeStatusFailed {
+			snapshot.LastError = rateError
 		} else {
-			upstreamBalanceUnsupported(snapshot.Data, "missing_balance", now)
-		}
-	} else {
-		balanceData := s.probeBalanceForAccount(ctx, account, normalizedBaseURL, proxyURL, tlsProfile, now)
-		for key, value := range balanceData {
-			snapshot.Data[key] = value
+			snapshot.LastError = balanceError
 		}
 	}
-	// 账号级值域与精度只在真要写回时才有影响：只观察上游声明、未开启同步的
-	// 账号不因声明值不适配 accounts.rate_multiplier 而被记成探测失败并进入
-	// 指数退避——探测本身成功了，原始声明照常存进快照供展示。
+	if topStatus == UpstreamBillingProbeStatusOK {
+		snapshot.FailureCount = 0
+	} else if previous != nil {
+		snapshot.FailureCount = previous.FailureCount + 1
+	} else {
+		snapshot.FailureCount = 1
+	}
+
 	var syncRate *float64
 	previousRate := account.BillingRateMultiplier()
-	if upstreamBillingRateSyncEnabled(account) {
-		value, valid := upstreamBillingProbeSyncRate(data)
+	if rateStatus == UpstreamBillingProbeStatusOK && upstreamBillingRateSyncEnabled(account) {
+		value, valid := upstreamBillingProbeSyncRate(rateData)
 		if shuaiAPI {
-			value, valid = shuaiAPIUsageSyncRate(data)
+			value, valid = shuaiAPIUsageSyncRate(rateData)
 		}
 		if valid {
 			syncRate = &value
 			snapshot.SyncedRateMultiplier = &value
-			if snapshot.Data == nil {
-				snapshot.Data = make(map[string]any)
-			}
-			snapshot.Data[UpstreamBillingProviderExtraKey] = map[bool]string{true: "shuai_api", false: "sub2api"}[shuaiAPI]
-			snapshot.Data[UpstreamRateMultiplierExtraKey] = value
-			snapshot.Data[UpstreamRateSourceExtraKey] = map[bool]string{true: "shuai_api_usage", false: "sub2api_billing"}[shuaiAPI]
-			snapshot.Data[UpstreamRateObservedAtExtraKey] = now.UTC().Format(time.RFC3339Nano)
+			data[UpstreamRateMultiplierExtraKey] = value
+			data[UpstreamRateSourceExtraKey] = rateSourceForProvider(provider, shuaiAPI)
+			data[UpstreamRateObservedAtExtraKey] = now.UTC().Format(time.RFC3339Nano)
 		} else {
-			declared, _ := resolveAccountExtraNumber(data, "resolved_rate_multiplier", "effective_rate_multiplier", "rate_multiplier")
-			slog.Warn("upstream_billing_rate_sync_rejected",
-				"source", "upstream_billing_probe",
-				"account_id", account.ID,
-				"declared_resolved_rate_multiplier", declared,
-				"max_rate_multiplier", upstreamBillingRateSyncMaxMultiplier,
-				"current_rate_multiplier", previousRate,
-			)
+			declared, _ := resolveAccountExtraNumber(rateData, "resolved_rate_multiplier", "effective_rate_multiplier", "rate_multiplier")
+			slog.Warn("upstream_billing_rate_sync_rejected", "source", "upstream_billing_probe", "account_id", account.ID, "declared_resolved_rate_multiplier", declared, "max_rate_multiplier", upstreamBillingRateSyncMaxMultiplier, "current_rate_multiplier", previousRate)
 		}
 	}
 	if err := s.updateSnapshot(ctx, account, snapshot, syncRate); err != nil {
@@ -791,6 +760,115 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		)
 	}
 	return snapshot, nil
+}
+
+func (s *UpstreamBillingProbeService) probeRateForAccount(ctx context.Context, account *Account, baseURL, proxyURL string, tlsProfile *tlsfingerprint.Profile, shuaiAPI, officialAPI bool, now time.Time) (map[string]any, string, string, int, time.Duration) {
+	if officialAPI {
+		return map[string]any{}, UpstreamBillingProbeStatusUnsupported, "unsupported_rate", 0, 0
+	}
+	endpoint := buildOpenAIEndpointURL(baseURL, "/v1/sub2api/billing")
+	if shuaiAPI {
+		endpoint = buildShuaiUsageURL(baseURL)
+	}
+	body, status, headers, err := s.upstreamBalanceProbeGET(ctx, account, endpoint, proxyURL, tlsProfile, shuaiAPI)
+	if err != nil {
+		if err.Error() == "empty response" {
+			return map[string]any{}, UpstreamBillingProbeStatusFailed, "empty_response", status, 0
+		}
+		return map[string]any{}, UpstreamBillingProbeStatusFailed, "request_failed", status, 0
+	}
+	if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+		return map[string]any{}, UpstreamBillingProbeStatusUnsupported, "unsupported_rate", status, 0
+	}
+	if status < 200 || status >= 300 {
+		return map[string]any{}, UpstreamBillingProbeStatusFailed, "http_error", status, retryAfter(headers, now)
+	}
+	var data map[string]any
+	if shuaiAPI {
+		data, err = parseShuaiAPIUsageResponse(body)
+	} else {
+		data, err = parseUpstreamBillingProbeResponse(body)
+	}
+	if err != nil {
+		return map[string]any{}, UpstreamBillingProbeStatusUnsupported, "unsupported_rate", status, 0
+	}
+	if _, hasRate := data["resolved_rate_multiplier"]; !hasRate {
+		return data, UpstreamBillingProbeStatusUnsupported, "missing_rate", status, 0
+	}
+	data["rate_source"] = rateSourceForProvider(resolveUpstreamProvider(account, baseURL, shuaiAPI, UpstreamBillingProbeStatusOK, UpstreamBillingProbeStatusUnsupported, data), shuaiAPI)
+	return data, UpstreamBillingProbeStatusOK, "", status, 0
+}
+
+func previousData(snapshot *UpstreamBillingProbeSnapshot) map[string]any {
+	if snapshot == nil {
+		return nil
+	}
+	return snapshot.Data
+}
+
+func cloneUpstreamBillingData(data map[string]any) map[string]any {
+	cloned := make(map[string]any, len(data)+8)
+	for key, value := range data {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func aggregateUpstreamProbeStatus(rateStatus, balanceStatus string) string {
+	if rateStatus == UpstreamBillingProbeStatusOK || balanceStatus == UpstreamBillingProbeStatusOK {
+		return UpstreamBillingProbeStatusOK
+	}
+	if rateStatus == UpstreamBillingProbeStatusUnsupported && balanceStatus == UpstreamBillingProbeStatusUnsupported {
+		return UpstreamBillingProbeStatusUnsupported
+	}
+	return UpstreamBillingProbeStatusFailed
+}
+
+func rateSourceForProvider(provider string, shuaiAPI bool) string {
+	if shuaiAPI || provider == UpstreamProviderShuai {
+		return "shuai_api_usage"
+	}
+	return "sub2api_billing"
+}
+
+func resolveUpstreamProvider(account *Account, baseURL string, shuaiAPI bool, rateStatus, balanceStatus string, data map[string]any) string {
+	valid := func(value string) string {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case UpstreamProviderSub2API, UpstreamProviderNewAPI, UpstreamProviderShuai, UpstreamProviderOpenCode, UpstreamProviderCustom:
+			return strings.ToLower(strings.TrimSpace(value))
+		default:
+			return ""
+		}
+	}
+	if account != nil && account.Extra != nil {
+		value, _ := account.Extra[UpstreamProviderExtraKey].(string)
+		if value == "" {
+			value, _ = account.Extra[UpstreamBillingProviderExtraKey].(string)
+		}
+		if strings.ToLower(strings.TrimSpace(value)) != UpstreamProviderAuto {
+			if provider := valid(value); provider != "" {
+				return provider
+			}
+		}
+	}
+	if account != nil {
+		if provider := valid(account.GetCredential("provider")); provider != "" {
+			return provider
+		}
+	}
+	if shuaiAPI {
+		return UpstreamProviderShuai
+	}
+	if rateStatus == UpstreamBillingProbeStatusOK {
+		return UpstreamProviderSub2API
+	}
+	if source, _ := data[UpstreamBalanceSourceExtraKey].(string); strings.Contains(source, "dashboard") || balanceStatus == UpstreamBillingProbeStatusOK && source == "openai_dashboard" {
+		return UpstreamProviderNewAPI
+	}
+	if parsed, err := url.Parse(strings.TrimSpace(baseURL)); err == nil && strings.Contains(strings.ToLower(parsed.Hostname()), "opencode.ai") {
+		return UpstreamProviderOpenCode
+	}
+	return UpstreamProviderCustom
 }
 
 func (s *UpstreamBillingProbeService) persistProbeFailure(
@@ -815,6 +893,10 @@ func (s *UpstreamBillingProbeService) persistProbeFailure(
 	}
 	snapshot := &UpstreamBillingProbeSnapshot{
 		Status:        status,
+		RateStatus:    status,
+		RateError:     reason,
+		BalanceStatus: status,
+		BalanceError:  reason,
 		LastAttemptAt: now,
 		NextProbeAt:   now.Add(delay),
 		FailureCount:  failureCount,
@@ -822,7 +904,8 @@ func (s *UpstreamBillingProbeService) persistProbeFailure(
 		LastError:     reason,
 	}
 	if previous != nil {
-		snapshot.Data = previous.Data
+		snapshot.Data = cloneUpstreamBillingData(previous.Data)
+		snapshot.Provider = previous.Provider
 		snapshot.ReceivedAt = previous.ReceivedAt
 		snapshot.FreshUntil = previous.FreshUntil
 		if snapshot.FreshUntil == nil && previous.Status == UpstreamBillingProbeStatusOK && previous.ReceivedAt != nil {
@@ -959,10 +1042,6 @@ func upstreamBalanceUnsupported(
 	if data == nil {
 		return
 	}
-	delete(data, UpstreamBalanceExtraKey)
-	delete(data, UpstreamBalanceUnitExtraKey)
-	delete(data, UpstreamBalanceTypeExtraKey)
-	delete(data, UpstreamBalanceSourceExtraKey)
 	data[UpstreamBalanceObservedAtExtraKey] = upstreamBillingBalanceObservedAt(now)
 	data[UpstreamBalanceErrorExtraKey] = reason
 }
@@ -973,7 +1052,7 @@ func firstUsageBalanceValue(values map[string]any, keys ...string) (float64, boo
 		if !ok {
 			continue
 		}
-		if balance, valid := finiteNonNegativeJSONNumber(value); valid {
+		if balance, valid := finiteJSONNumber(value); valid {
 			return balance, true
 		}
 	}
@@ -991,54 +1070,112 @@ func parseUpstreamUsageBalance(body []byte) (float64, string, string, bool) {
 	if active, ok := response["is_active"].(bool); ok && !active {
 		return 0, "", "", false
 	}
-	balance, ok := firstUsageBalanceValue(response, "remaining", "balance", "available_balance", "total_available", "total_balance", "credit")
-	if !ok {
-		if data, isMap := response["data"].(map[string]any); isMap {
-			balance, ok = firstUsageBalanceValue(data, "remaining", "balance", "available_balance", "total_available", "total_balance", "credit")
-		}
-	}
-	if !ok {
-		if quota, isMap := response["quota"].(map[string]any); isMap {
-			balance, ok = firstUsageBalanceValue(quota, "remaining", "balance", "available_balance")
-		}
-	}
+	balance, source, ok := findUpstreamUsageBalance(response)
 	if !ok {
 		return 0, "", "", false
 	}
-	unit, _ := response["unit"].(string)
+	unit := firstUpstreamString(source, response, "unit", "currency")
 	if strings.TrimSpace(unit) == "" {
 		unit = "USD"
 	}
 	balanceType := "wallet"
-	if mode, _ := response["mode"].(string); mode == "quota_limited" {
+	if mode := firstUpstreamString(source, response, "mode"); mode == "quota_limited" {
 		balanceType = "quota_remaining"
+	} else if _, ok := source["subscription"].(map[string]any); ok {
+		balanceType = "subscription"
 	} else if _, ok := response["subscription"].(map[string]any); ok {
 		balanceType = "subscription"
 	}
 	return balance, strings.TrimSpace(unit), balanceType, true
 }
 
+// findUpstreamUsageBalance handles bounded envelopes used by compatible relays.
+func findUpstreamUsageBalance(response map[string]any) (float64, map[string]any, bool) {
+	if response == nil {
+		return 0, nil, false
+	}
+	queue := []map[string]any{response}
+	for len(queue) > 0 {
+		candidate := queue[0]
+		queue = queue[1:]
+		if candidate == nil {
+			continue
+		}
+		if balance, ok := firstUsageBalanceValue(candidate, "remaining", "balance", "available_balance", "total_available", "total_balance", "credit"); ok {
+			return balance, candidate, true
+		}
+		for _, key := range []string{"data", "quota", "usage", "subscription"} {
+			if nested, ok := candidate[key].(map[string]any); ok {
+				queue = append(queue, nested)
+			}
+		}
+		if len(queue) > 16 {
+			queue = queue[:16]
+		}
+	}
+	return 0, nil, false
+}
+
+func firstUpstreamString(primary, fallback map[string]any, keys ...string) string {
+	for _, values := range []map[string]any{primary, fallback} {
+		for _, key := range keys {
+			if value, ok := values[key].(string); ok && strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		}
+	}
+	return ""
+}
+
 func parseUpstreamOpenAIBilling(body []byte) (float64, bool) {
-	var response struct {
-		HardLimitUSD *float64 `json:"hard_limit_usd"`
-	}
-	if err := json.Unmarshal(body, &response); err != nil || response.HardLimitUSD == nil {
+	var response map[string]any
+	if err := json.Unmarshal(body, &response); err != nil {
 		return 0, false
 	}
-	if *response.HardLimitUSD > 1000000 {
+	limit, ok := findUpstreamNumber(response, "hard_limit_usd", "hard_limit", "limit")
+	if !ok || limit < 0 || math.IsNaN(limit) || math.IsInf(limit, 0) || limit > 1000000 {
 		return 0, false
 	}
-	return *response.HardLimitUSD, true
+	return limit, true
 }
 
 func parseUpstreamOpenAIUsage(body []byte) (float64, bool) {
-	var response struct {
-		TotalUsage *float64 `json:"total_usage"`
-	}
-	if err := json.Unmarshal(body, &response); err != nil || response.TotalUsage == nil {
+	var response map[string]any
+	if err := json.Unmarshal(body, &response); err != nil {
 		return 0, false
 	}
-	return *response.TotalUsage, true
+	usage, ok := findUpstreamNumber(response, "total_usage")
+	if !ok || usage < 0 || math.IsNaN(usage) || math.IsInf(usage, 0) {
+		return 0, false
+	}
+	return usage, true
+}
+
+func findUpstreamNumber(response map[string]any, keys ...string) (float64, bool) {
+	if response == nil {
+		return 0, false
+	}
+	queue := []map[string]any{response}
+	for len(queue) > 0 {
+		candidate := queue[0]
+		queue = queue[1:]
+		for _, key := range keys {
+			if value, exists := candidate[key]; exists {
+				if number, ok := finiteJSONNumber(value); ok {
+					return number, true
+				}
+			}
+		}
+		for _, key := range []string{"data", "usage", "subscription"} {
+			if nested, ok := candidate[key].(map[string]any); ok {
+				queue = append(queue, nested)
+			}
+		}
+		if len(queue) > 16 {
+			queue = queue[:16]
+		}
+	}
+	return 0, false
 }
 
 func (s *UpstreamBillingProbeService) upstreamBalanceProbeGET(
@@ -1047,12 +1184,19 @@ func (s *UpstreamBillingProbeService) upstreamBalanceProbeGET(
 	probeURL string,
 	proxyURL string,
 	tlsProfile *tlsfingerprint.Profile,
-) ([]byte, int, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, upstreamBillingProbeRequestTimeout)
+	shuaiAPI bool,
+) ([]byte, int, http.Header, error) {
+	timeout := upstreamBillingProbeRequestTimeout
+	maxBodyBytes := upstreamBillingProbeMaxBodyBytes
+	if shuaiAPI {
+		timeout = upstreamBillingShuaiRequestTimeout
+		maxBodyBytes = upstreamBillingShuaiMaxBodyBytes
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, probeURL, bytes.NewReader(nil))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	profile := HTTPUpstreamProfileDefault
 	if account.Platform == PlatformOpenAI {
@@ -1062,23 +1206,26 @@ func (s *UpstreamBillingProbeService) upstreamBalanceProbeGET(
 	req = req.WithContext(WithHTTPUpstreamRedirectsDisabled(reqCtx))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+account.GetCredential("api_key"))
+	if shuaiAPI {
+		req.Header.Set("User-Agent", "cc-switch/1.0")
+	}
 	account.ApplyHeaderOverrides(req.Header)
 	resp, err := s.accountTestService.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	if resp == nil || resp.Body == nil {
-		return nil, 0, fmt.Errorf("empty response")
+		return nil, 0, nil, fmt.Errorf("empty response")
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(upstreamBillingProbeMaxBodyBytes)+1))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(maxBodyBytes)+1))
 	if readErr != nil {
-		return nil, resp.StatusCode, readErr
+		return nil, resp.StatusCode, resp.Header, readErr
 	}
-	if len(body) > upstreamBillingProbeMaxBodyBytes {
-		return nil, resp.StatusCode, fmt.Errorf("response too large")
+	if len(body) > maxBodyBytes {
+		return nil, resp.StatusCode, resp.Header, fmt.Errorf("response too large")
 	}
-	return body, resp.StatusCode, nil
+	return body, resp.StatusCode, resp.Header, nil
 }
 
 func (s *UpstreamBillingProbeService) probeBalanceForAccount(
@@ -1088,50 +1235,63 @@ func (s *UpstreamBillingProbeService) probeBalanceForAccount(
 	proxyURL string,
 	tlsProfile *tlsfingerprint.Profile,
 	now time.Time,
-) map[string]any {
+	shuaiAPI bool,
+	rateData map[string]any,
+) (map[string]any, string, string) {
 	result := make(map[string]any)
+	if shuaiAPI {
+		if balance, ok := firstUsageBalanceValue(rateData, UpstreamBalanceExtraKey, "remaining", "balance", "available_balance", "total_available"); ok {
+			upstreamBalanceSnapshotData(result, balance, "USD", "quota_remaining", "shuai_api_usage", now)
+			return result, UpstreamBillingProbeStatusOK, ""
+		}
+		return result, UpstreamBillingProbeStatusUnsupported, "missing_balance"
+	}
 	usageURL := buildOpenAIEndpointURL(baseURL, "/v1/usage")
-	body, usageStatus, err := s.upstreamBalanceProbeGET(ctx, account, usageURL, proxyURL, tlsProfile)
+	body, usageStatus, _, err := s.upstreamBalanceProbeGET(ctx, account, usageURL, proxyURL, tlsProfile, false)
 	if err == nil && usageStatus >= 200 && usageStatus < 300 {
 		if balance, unit, balanceType, ok := parseUpstreamUsageBalance(body); ok {
 			upstreamBalanceSnapshotData(result, balance, unit, balanceType, "usage_endpoint", now)
-			return result
+			return result, UpstreamBillingProbeStatusOK, ""
 		}
 	}
 	subscriptionURL := buildOpenAIEndpointURL(baseURL, "/v1/dashboard/billing/subscription")
-	subscriptionBody, _, subErr := s.upstreamBalanceProbeGET(ctx, account, subscriptionURL, proxyURL, tlsProfile)
+	subscriptionBody, subscriptionStatus, _, subErr := s.upstreamBalanceProbeGET(ctx, account, subscriptionURL, proxyURL, tlsProfile, false)
 	startDate := now.UTC().Format("2006-01") + "-01"
 	endDate := now.UTC().Format("2006-01-02")
 	usageDashboardURL := buildOpenAIEndpointURL(baseURL, "/v1/dashboard/billing/usage") + "?start_date=" + url.QueryEscape(startDate) + "&end_date=" + url.QueryEscape(endDate)
-	usageBody, _, usageErr := s.upstreamBalanceProbeGET(ctx, account, usageDashboardURL, proxyURL, tlsProfile)
+	usageBody, usageDashboardStatus, _, usageErr := s.upstreamBalanceProbeGET(ctx, account, usageDashboardURL, proxyURL, tlsProfile, false)
 	if subErr == nil && usageErr == nil {
 		if limit, ok := parseUpstreamOpenAIBilling(subscriptionBody); ok {
 			if usageCents, usageOK := parseUpstreamOpenAIUsage(usageBody); usageOK {
 				balance := limit - usageCents/100
-				if balance < 0 {
-					balance = 0
-				}
 				upstreamBalanceSnapshotData(result, balance, "USD", "subscription", "openai_dashboard", now)
-				return result
+				return result, UpstreamBillingProbeStatusOK, ""
 			}
 		}
 	}
-	if err != nil {
-		upstreamBalanceUnsupported(result, "request_failed", now)
-	} else if usageStatus == http.StatusNotFound || usageStatus == http.StatusMethodNotAllowed {
-		upstreamBalanceUnsupported(result, "unsupported_balance", now)
+	if usageErr != nil || subErr != nil {
+		return result, UpstreamBillingProbeStatusFailed, "request_failed"
+	} else if isUnsupportedUpstreamStatus(usageStatus) && isUnsupportedUpstreamStatus(subscriptionStatus) && isUnsupportedUpstreamStatus(usageDashboardStatus) {
+		return result, UpstreamBillingProbeStatusUnsupported, "unsupported_balance"
 	} else {
-		upstreamBalanceUnsupported(result, "invalid_response", now)
+		return result, UpstreamBillingProbeStatusFailed, "invalid_response"
 	}
-	return result
+}
+
+func isUnsupportedUpstreamStatus(status int) bool {
+	return status == http.StatusNotFound || status == http.StatusMethodNotAllowed
 }
 
 // isShuaiAPIAccount identifies the 帅API usage endpoint without requiring a
 // schema migration. The explicit provider marker is useful for custom domains
 // and is intentionally checked before host matching.
 func isShuaiAPIAccount(account *Account, baseURL string) bool {
-	if account != nil && strings.EqualFold(strings.TrimSpace(account.GetCredential("provider")), "shuai_api") {
-		return true
+	if account != nil {
+		for _, value := range []any{account.GetCredential("provider"), account.Extra[UpstreamProviderExtraKey], account.Extra[UpstreamBillingProviderExtraKey]} {
+			if provider, ok := value.(string); ok && strings.EqualFold(strings.TrimSpace(provider), UpstreamProviderShuai) {
+				return true
+			}
+		}
 	}
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil {
@@ -1186,19 +1346,19 @@ func parseShuaiAPIUsageResponse(body []byte) (map[string]any, error) {
 		result["object"] = object
 	}
 	if display, ok := data["display"].(map[string]any); ok {
-		if remaining, valid := finiteNonNegativeJSONNumber(display["remaining"]); valid {
+		if remaining, valid := finiteJSONNumber(display["remaining"]); valid {
 			result["balance"] = remaining
 			result["unit"] = "USD"
 		}
 	}
 	if _, exists := result["balance"]; !exists {
-		if available, valid := finiteNonNegativeJSONNumber(data["total_available"]); valid {
+		if available, valid := finiteJSONNumber(data["total_available"]); valid {
 			result["balance"] = available / 500000
 			result["unit"] = "USD"
 		} else {
-			granted, grantedOK := finiteNonNegativeJSONNumber(data["total_granted"])
-			used, usedOK := finiteNonNegativeJSONNumber(data["total_used"])
-			if grantedOK && usedOK && granted >= used {
+			granted, grantedOK := finiteJSONNumber(data["total_granted"])
+			used, usedOK := finiteJSONNumber(data["total_used"])
+			if grantedOK && usedOK {
 				result["balance"] = (granted - used) / 500000
 				result["unit"] = "USD"
 			}
@@ -1242,6 +1402,11 @@ func parseShuaiAPIUsageResponse(body []byte) (map[string]any, error) {
 }
 
 func finiteNonNegativeJSONNumber(value any) (float64, bool) {
+	number, ok := finiteJSONNumber(value)
+	return number, ok && number >= 0
+}
+
+func finiteJSONNumber(value any) (float64, bool) {
 	var number float64
 	switch v := value.(type) {
 	case float64:
@@ -1267,7 +1432,7 @@ func finiteNonNegativeJSONNumber(value any) (float64, bool) {
 	default:
 		return 0, false
 	}
-	return number, number >= 0 && !math.IsNaN(number) && !math.IsInf(number, 0)
+	return number, !math.IsNaN(number) && !math.IsInf(number, 0)
 }
 
 func shuaiAPIUsageSyncRate(data map[string]any) (float64, bool) {
@@ -1276,7 +1441,7 @@ func shuaiAPIUsageSyncRate(data map[string]any) (float64, bool) {
 		return 0, false
 	}
 	rounded := math.Round(value*upstreamBillingProbeAccountRateScale) / upstreamBillingProbeAccountRateScale
-	if rounded < 0 || rounded > upstreamBillingRateSyncMaxMultiplier {
+	if rounded <= 0 || rounded > upstreamBillingRateSyncMaxMultiplier {
 		return 0, false
 	}
 	return rounded, true

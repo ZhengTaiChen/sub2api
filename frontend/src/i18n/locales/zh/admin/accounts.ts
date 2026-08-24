@@ -197,6 +197,18 @@ export default {
         rateSource: '倍率来源：{value}',
         balance: '余额：{value}',
         balanceUnknown: '余额：未知',
+        balanceLow: '低余额',
+        balanceExpired: '余额已过期',
+        provider: '上游类型',
+        providerHint: '用于选择上游倍率和余额探测适配器；自动模式会根据响应识别。',
+        providers: {
+          auto: '自动识别',
+          sub2api: 'Sub2API',
+          newApi: 'new-api',
+          shuaiApi: '帅 API',
+          opencode: 'OpenCode',
+          custom: '自定义上游'
+        },
         shuaiApiUsage: '帅API上游',
         sub2apiBilling: 'Sub2API上游',
         nextProbeAt: '下一次探测：{value}',

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,209 @@ type userHandlerRepoStub struct {
 	user       *service.User
 	identities []service.UserAuthIdentityRecord
 	unbound    []string
+}
+
+type userHandlerUpstreamGroupsStub struct {
+	groups []service.Group
+	err    error
+}
+
+func (s *userHandlerUpstreamGroupsStub) GetAvailableGroups(context.Context, int64) ([]service.Group, error) {
+	return s.groups, s.err
+}
+
+type userHandlerUpstreamAccountsStub struct {
+	accounts map[int64][]service.Account
+	err      error
+}
+
+func (s *userHandlerUpstreamAccountsStub) ListByGroup(_ context.Context, groupID int64) ([]service.Account, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.accounts[groupID], nil
+}
+
+func newUserHandlerForUpstreamBilling(groups []service.Group, accounts map[int64][]service.Account) *UserHandler {
+	handler := NewUserHandler(nil, nil, nil, nil, nil, nil)
+	handler.SetUpstreamBillingDependencies(
+		&userHandlerUpstreamGroupsStub{groups: groups},
+		&userHandlerUpstreamAccountsStub{accounts: accounts},
+	)
+	return handler
+}
+
+func userHandlerUpstreamAccount(id int64, groupIDs []int64, extra map[string]any) service.Account {
+	return service.Account{
+		ID:       id,
+		Name:     "shared-account",
+		Platform: "openai",
+		Status:   service.StatusActive,
+		GroupIDs: groupIDs,
+		Extra:    extra,
+	}
+}
+
+func userHandlerUpstreamEnabledExtra(snapshot map[string]any) map[string]any {
+	return map[string]any{
+		service.UpstreamBillingProbeEnabledExtraKey: true,
+		service.UpstreamBillingProbeExtraKey:        snapshot,
+	}
+}
+
+func userHandlerUpstreamRequest(authenticated bool) (*gin.Context, *httptest.ResponseRecorder) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/user/upstream-billing", nil)
+	if authenticated {
+		c.Set(string(middleware2.ContextKeyUser), middleware2.AuthSubject{UserID: 42})
+	}
+	return c, recorder
+}
+
+func userHandlerUpstreamResponse(t *testing.T, recorder *httptest.ResponseRecorder) []map[string]any {
+	t.Helper()
+	var response struct {
+		Code int `json:"code"`
+		Data struct {
+			Accounts []map[string]any `json:"upstream_billing"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	require.Equal(t, 0, response.Code)
+	return response.Data.Accounts
+}
+
+func TestUserHandlerGetUpstreamBillingReturnsAuthorizedIntersection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	balance := 12.5
+	rate := 0.8
+	snapshot := map[string]any{
+		"status":      service.UpstreamBillingProbeStatusOK,
+		"rate_status": service.UpstreamBillingProbeStatusOK,
+		"data": map[string]any{
+			service.UpstreamBalanceExtraKey:           balance,
+			service.UpstreamBalanceUnitExtraKey:       "USD",
+			service.UpstreamBalanceTypeExtraKey:       "subscription",
+			service.UpstreamBalanceSourceExtraKey:     "openai_dashboard",
+			service.UpstreamBalanceObservedAtExtraKey: "2026-08-23T00:00:00Z",
+			"balance_status":                          service.UpstreamBillingProbeStatusOK,
+		},
+	}
+	account := userHandlerUpstreamAccount(1, []int64{10}, userHandlerUpstreamEnabledExtra(snapshot))
+	account.RateMultiplier = &rate
+	account.Extra["upstream_provider"] = "new_api"
+	handler := newUserHandlerForUpstreamBilling([]service.Group{{ID: 10}}, map[int64][]service.Account{10: {account}})
+	c, recorder := userHandlerUpstreamRequest(true)
+
+	handler.GetUpstreamBilling(c)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	accounts := userHandlerUpstreamResponse(t, recorder)
+	require.Len(t, accounts, 1)
+	require.Equal(t, float64(1), accounts[0]["account_id"])
+	require.Equal(t, "new_api", accounts[0]["provider"])
+	require.Equal(t, rate, accounts[0]["rate_multiplier"])
+	require.Equal(t, service.UpstreamBillingProbeStatusOK, accounts[0]["rate_status"])
+	require.Equal(t, balance, accounts[0]["balance"])
+	require.Equal(t, "USD", accounts[0]["unit"])
+	require.Equal(t, service.UpstreamBillingProbeStatusOK, accounts[0]["balance_status"])
+	require.Equal(t, "2026-08-23T00:00:00Z", accounts[0]["observed_at"])
+	for _, key := range []string{"account_id", "name", "platform", "provider", "rate_multiplier", "rate_status", "rate_error", "balance", "unit", "balance_type", "balance_source", "balance_status", "balance_error", "observed_at", "updated_at"} {
+		require.Contains(t, accounts[0], key)
+	}
+}
+
+func TestUserHandlerGetUpstreamBillingExcludesNonIntersectionAndInactiveAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	visible := userHandlerUpstreamAccount(1, []int64{10}, userHandlerUpstreamEnabledExtra(nil))
+	notVisible := userHandlerUpstreamAccount(2, []int64{99}, userHandlerUpstreamEnabledExtra(nil))
+	inactive := userHandlerUpstreamAccount(3, []int64{10}, userHandlerUpstreamEnabledExtra(nil))
+	inactive.Status = service.StatusDisabled
+	handler := newUserHandlerForUpstreamBilling([]service.Group{{ID: 10}}, map[int64][]service.Account{10: {visible, notVisible, inactive}})
+	c, recorder := userHandlerUpstreamRequest(true)
+
+	handler.GetUpstreamBilling(c)
+
+	accounts := userHandlerUpstreamResponse(t, recorder)
+	require.Len(t, accounts, 1)
+	require.Equal(t, float64(1), accounts[0]["account_id"])
+}
+
+func TestUserHandlerGetUpstreamBillingDeduplicatesAccountsAcrossGroups(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	account := userHandlerUpstreamAccount(7, []int64{10, 20}, userHandlerUpstreamEnabledExtra(nil))
+	handler := newUserHandlerForUpstreamBilling(
+		[]service.Group{{ID: 10}, {ID: 20}},
+		map[int64][]service.Account{10: {account}, 20: {account}},
+	)
+	c, recorder := userHandlerUpstreamRequest(true)
+
+	handler.GetUpstreamBilling(c)
+
+	accounts := userHandlerUpstreamResponse(t, recorder)
+	require.Len(t, accounts, 1)
+	require.Equal(t, float64(7), accounts[0]["account_id"])
+}
+
+func TestUserHandlerGetUpstreamBillingIncludesEnabledAccountWithoutSnapshot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	account := userHandlerUpstreamAccount(8, []int64{10}, map[string]any{
+		service.UpstreamBillingProbeEnabledExtraKey: true,
+	})
+	handler := newUserHandlerForUpstreamBilling([]service.Group{{ID: 10}}, map[int64][]service.Account{10: {account}})
+	c, recorder := userHandlerUpstreamRequest(true)
+
+	handler.GetUpstreamBilling(c)
+
+	accounts := userHandlerUpstreamResponse(t, recorder)
+	require.Len(t, accounts, 1)
+	require.Equal(t, float64(8), accounts[0]["account_id"])
+	require.Nil(t, accounts[0]["balance"])
+	require.Equal(t, "unknown", accounts[0]["balance_status"])
+}
+
+func TestUserHandlerGetUpstreamBillingExcludesProbeDisabledAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	account := userHandlerUpstreamAccount(9, []int64{10}, map[string]any{})
+	handler := newUserHandlerForUpstreamBilling([]service.Group{{ID: 10}}, map[int64][]service.Account{10: {account}})
+	c, recorder := userHandlerUpstreamRequest(true)
+
+	handler.GetUpstreamBilling(c)
+
+	accounts := userHandlerUpstreamResponse(t, recorder)
+	require.Empty(t, accounts)
+}
+
+func TestUserHandlerGetUpstreamBillingDoesNotLeakCredentials(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	account := userHandlerUpstreamAccount(11, []int64{10}, userHandlerUpstreamEnabledExtra(nil))
+	account.Credentials = map[string]any{
+		"api_key":  "sk-secret-value",
+		"base_url": "https://upstream.example.com",
+		"cookie":   "session-secret",
+	}
+	handler := newUserHandlerForUpstreamBilling([]service.Group{{ID: 10}}, map[int64][]service.Account{10: {account}})
+	c, recorder := userHandlerUpstreamRequest(true)
+
+	handler.GetUpstreamBilling(c)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	body := recorder.Body.String()
+	for _, secret := range []string{"sk-secret-value", "upstream.example.com", "session-secret", "api_key", "base_url", "cookie"} {
+		require.NotContains(t, body, secret)
+	}
+}
+
+func TestUserHandlerGetUpstreamBillingRequiresAuthentication(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := newUserHandlerForUpstreamBilling(nil, nil)
+	c, recorder := userHandlerUpstreamRequest(false)
+
+	handler.GetUpstreamBilling(c)
+
+	require.Equal(t, http.StatusUnauthorized, recorder.Code)
+	require.True(t, strings.Contains(recorder.Body.String(), "not authenticated"))
 }
 
 func (s *userHandlerRepoStub) Create(context.Context, *service.User) error { return nil }

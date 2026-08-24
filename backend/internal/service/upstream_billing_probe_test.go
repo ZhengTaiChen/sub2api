@@ -270,6 +270,9 @@ func TestUpstreamUsageBalanceParsing(t *testing.T) {
 	require.Equal(t, 5.25, balance)
 	require.Equal(t, "USD", unit)
 	require.Equal(t, "quota_remaining", balanceType)
+	balance, _, _, ok = parseUpstreamUsageBalance([]byte(`{"remaining":-2.5,"unit":"USD"}`))
+	require.True(t, ok)
+	require.Equal(t, -2.5, balance)
 }
 
 func TestUpstreamOpenAIBillingParsing(t *testing.T) {

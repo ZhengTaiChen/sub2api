@@ -143,6 +143,19 @@
           <p class="input-hint">{{ t('admin.accounts.leaveEmptyToKeep') }}</p>
         </div>
 
+        <div>
+          <label class="input-label">{{ t('admin.accounts.upstreamBilling.provider') }}</label>
+          <select v-model="upstreamProvider" class="input" data-testid="upstream-provider">
+            <option value="auto">{{ t('admin.accounts.upstreamBilling.providers.auto') }}</option>
+            <option value="sub2api">{{ t('admin.accounts.upstreamBilling.providers.sub2api') }}</option>
+            <option value="new_api">{{ t('admin.accounts.upstreamBilling.providers.newApi') }}</option>
+            <option value="shuai_api">{{ t('admin.accounts.upstreamBilling.providers.shuaiApi') }}</option>
+            <option value="opencode">{{ t('admin.accounts.upstreamBilling.providers.opencode') }}</option>
+            <option value="custom">{{ t('admin.accounts.upstreamBilling.providers.custom') }}</option>
+          </select>
+          <p class="input-hint">{{ t('admin.accounts.upstreamBilling.providerHint') }}</p>
+        </div>
+
         <!-- Model Restriction Section (不适用于 Antigravity) -->
         <div v-if="account.platform !== 'antigravity'" class="border-t border-gray-200 pt-4 dark:border-dark-600">
           <label class="input-label">{{ t('admin.accounts.modelRestriction') }}</label>
@@ -2789,7 +2802,8 @@ import type {
   OpenAICompactMode,
   OpenAIResponsesMode,
   OpenAIEndpointCapability,
-  OllamaCloudUsageState
+  OllamaCloudUsageState,
+  UpstreamProvider
 } from '@/types'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
@@ -3100,6 +3114,21 @@ const autoPause5hDisabled = ref(false)
 const autoPause7dDisabled = ref(false)
 const upstreamBillingAutoProbeEnabled = ref(false)
 const upstreamBillingRateSyncEnabled = ref(false)
+const upstreamProvider = ref<UpstreamProvider>('auto')
+
+function normalizeUpstreamProvider(value: unknown): UpstreamProvider {
+  if (typeof value !== 'string') return 'auto'
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'shuai') return 'shuai_api'
+  return normalized === 'sub2api' ||
+    normalized === 'new_api' ||
+    normalized === 'shuai_api' ||
+    normalized === 'opencode' ||
+    normalized === 'custom' ||
+    normalized === 'auto'
+    ? normalized
+    : 'auto'
+}
 const mixedScheduling = ref(false) // For antigravity accounts: enable mixed scheduling
 const allowOverages = ref(false) // For antigravity accounts: enable AI Credits overages
 const antigravityProjectId = ref('')
@@ -3627,6 +3656,9 @@ const syncFormFromAccount = (newAccount: Account | null) => {
 	autoPause5hDisabled.value = extra?.auto_pause_5h_disabled === true
 	autoPause7dDisabled.value = extra?.auto_pause_7d_disabled === true
 	upstreamBillingAutoProbeEnabled.value = extra?.upstream_billing_probe_enabled === true
+  upstreamProvider.value = normalizeUpstreamProvider(
+    extra?.upstream_provider ?? extra?.upstream_billing_provider
+  )
   upstreamBillingRateSyncEnabled.value =
     upstreamBillingAutoProbeEnabled.value && extra?.upstream_billing_rate_sync_enabled === true
 
@@ -5140,6 +5172,7 @@ const handleSubmit = async () => {
       if (props.account.type === 'apikey') {
         delete newExtra.upstream_billing_probe_enabled
         delete newExtra.upstream_billing_rate_sync_enabled
+        newExtra.upstream_provider = normalizeUpstreamProvider(upstreamProvider.value)
       }
       // Total quota
       if (editQuotaLimit.value != null && editQuotaLimit.value > 0) {

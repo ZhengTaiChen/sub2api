@@ -23,9 +23,28 @@ import type {
   CheckMixedChannelResponse,
   UpstreamBillingProbeResult,
   UpstreamBillingProbeSettings,
+  UpstreamProvider,
   OllamaCloudUsageSettings,
   OllamaCloudUsageState
 } from '@/types'
+
+export const UPSTREAM_PROVIDER_VALUES: readonly UpstreamProvider[] = [
+  'auto',
+  'sub2api',
+  'new_api',
+  'shuai_api',
+  'opencode',
+  'custom'
+]
+
+export function normalizeUpstreamProvider(value: unknown): UpstreamProvider {
+  if (typeof value !== 'string') return 'auto'
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'shuai') return 'shuai_api'
+  return UPSTREAM_PROVIDER_VALUES.includes(normalized as UpstreamProvider)
+    ? (normalized as UpstreamProvider)
+    : 'auto'
+}
 
 /**
  * List all accounts with pagination

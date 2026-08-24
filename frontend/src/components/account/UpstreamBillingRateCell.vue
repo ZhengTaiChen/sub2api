@@ -11,34 +11,48 @@
         </span>
       </template>
       <div class="space-y-1">
-        <template v-if="hasEffectiveRate && data">
-          <p>{{ t('admin.accounts.upstreamBilling.groupRate', { value: data.group_rate_multiplier }) }}</p>
-          <p v-if="data.user_rate_multiplier != null">
-            {{ t('admin.accounts.upstreamBilling.userRate', { value: data.user_rate_multiplier }) }}
+        <template v-if="data">
+          <template v-if="hasEffectiveRate">
+            <p>{{ t('admin.accounts.upstreamBilling.groupRate', { value: data.group_rate_multiplier }) }}</p>
+            <p v-if="data.user_rate_multiplier != null">
+              {{ t('admin.accounts.upstreamBilling.userRate', { value: data.user_rate_multiplier }) }}
+            </p>
+            <p>
+              {{
+                data.peak_rate_enabled
+                  ? t('admin.accounts.upstreamBilling.peakRate', {
+                      start: data.peak_start,
+                      end: data.peak_end,
+                      value: data.peak_rate_multiplier,
+                      timezone: data.timezone
+                    })
+                  : t('admin.accounts.upstreamBilling.noPeakRate')
+              }}
+            </p>
+            <p>{{ t('admin.accounts.upstreamBilling.effectiveRate', { value: currentEffectiveRate ?? '-' }) }}</p>
+          </template>
+          <template v-else-if="stale && lastDetectedRate != null">
+            <p data-testid="upstream-billing-last-rate">
+              {{ t('admin.accounts.upstreamBilling.lastDetectedRate', { value: lastDetectedRate }) }}
+            </p>
+            <p data-testid="upstream-billing-last-time">
+              {{ t('admin.accounts.upstreamBilling.lastDetectedAt', { value: formatDate(snapshot?.received_at) }) }}
+            </p>
+            <p data-testid="upstream-billing-elapsed">
+              {{ t('admin.accounts.upstreamBilling.elapsedSince', { value: elapsedSinceLastSuccess }) }}
+            </p>
+          </template>
+          <p>{{ t('admin.accounts.upstreamBilling.updatedAt', { value: formatDate(snapshot?.received_at) }) }}</p>
+          <p v-if="providerLabel" data-testid="upstream-billing-provider">
+            {{ t('admin.accounts.upstreamBilling.provider', { value: providerLabel }) }}
           </p>
-          <p>
-            {{
-              data.peak_rate_enabled
-                ? t('admin.accounts.upstreamBilling.peakRate', {
-                    start: data.peak_start,
-                    end: data.peak_end,
-                    value: data.peak_rate_multiplier,
-                    timezone: data.timezone
-                  })
-                : t('admin.accounts.upstreamBilling.noPeakRate')
-            }}
+          <p v-if="sourceLabel" data-testid="upstream-billing-source">
+            {{ t('admin.accounts.upstreamBilling.rateSource', { value: sourceLabel }) }}
           </p>
-		  <p>{{ t('admin.accounts.upstreamBilling.effectiveRate', { value: currentEffectiveRate ?? '-' }) }}</p>
-		  <p>{{ t('admin.accounts.upstreamBilling.updatedAt', { value: formatDate(snapshot?.received_at) }) }}</p>
-		  <p v-if="sourceLabel" data-testid="upstream-billing-source">
-		    {{ t('admin.accounts.upstreamBilling.rateSource', { value: sourceLabel }) }}
-		  </p>
-		  <p v-if="balanceValue != null" data-testid="upstream-billing-balance" :class="{ 'text-red-500 dark:text-red-400': balanceLow }">
-		    {{ t('admin.accounts.upstreamBilling.balance', { value: balanceText }) }}
-		  </p>
-		  <p v-else-if="balanceError" data-testid="upstream-billing-balance-error">
-		    {{ t('admin.accounts.upstreamBilling.balanceUnknown') }}
-		  </p>
+          <p data-testid="upstream-billing-balance" :class="{ 'text-red-500 dark:text-red-400': balanceLow }">
+            {{ t('admin.accounts.upstreamBilling.balance', { value: balanceText }) }}
+            <span v-if="balanceStatusLabel">（{{ balanceStatusLabel }}）</span>
+          </p>
         </template>
         <template v-else-if="stale && lastDetectedRate != null">
           <p data-testid="upstream-billing-last-rate">
@@ -201,6 +215,18 @@ const sourceLabel = computed(() => {
   if (source === 'sub2api_billing') return t('admin.accounts.upstreamBilling.sub2apiBilling')
   return ''
 })
+const providerLabel = computed(() => {
+  const provider = snapshot.value?.provider ?? data.value?.provider
+  if (!provider || provider === 'auto') return ''
+  const labels: Record<string, string> = {
+    sub2api: 'Sub2API',
+    new_api: 'new-api',
+    shuai_api: '帅 API',
+    opencode: 'OpenCode',
+    custom: 'Custom'
+  }
+  return labels[provider] || provider
+})
 const balanceValue = computed(() => {
   const billing = data.value
   if (!billing) return null
@@ -215,6 +241,21 @@ const balanceText = computed(() => {
 })
 const balanceLow = computed(() => balanceValue.value != null && balanceValue.value <= 0)
 const balanceError = computed(() => data.value?.balance_error || data.value?.upstream_balance_error || '')
+const balanceExpired = computed(() => {
+  const status = snapshot.value?.balance_status ?? data.value?.balance_status
+  return status === 'failed' || status === 'unsupported' || Boolean(balanceError.value)
+})
+const balanceStatusLabel = computed(() => {
+  if (balanceExpired.value && balanceValue.value != null) {
+    return t('admin.accounts.upstreamBilling.balanceExpired')
+  }
+  if (balanceValue.value != null && balanceValue.value <= 0) return t('admin.accounts.upstreamBilling.balanceLow')
+  const status = snapshot.value?.balance_status ?? data.value?.balance_status
+  if (status === 'failed' || status === 'unsupported' || status === 'unknown' || balanceValue.value == null) {
+    return t('admin.accounts.upstreamBilling.balanceUnknown')
+  }
+  return ''
+})
 const elapsedSinceLastSuccess = computed(() => {
   if (!Number.isFinite(receivedAt.value)) return '-'
   const elapsedMinutes = Math.max(0, Math.floor((props.now - receivedAt.value) / 60_000))

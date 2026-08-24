@@ -1044,12 +1044,57 @@ export interface UpstreamBillingData {
 	upstream_balance_error?: string
 	balance_error?: string
 	checked_at?: string
+	provider?: UpstreamProvider
+	rate_status?: UpstreamRateStatus
+	rate_error?: string
+	balance_status?: UpstreamBalanceStatus
+	balance_type?: string
+	balance_source?: string
+	balance_observed_at?: string
+}
+
+export type UpstreamProvider =
+  | 'auto'
+  | 'sub2api'
+  | 'new_api'
+  | 'shuai_api'
+  | 'opencode'
+  | 'custom'
+
+export type UpstreamBalanceStatus = 'ok' | 'unsupported' | 'failed' | 'unknown'
+export type UpstreamRateStatus = 'ok' | 'unsupported' | 'failed' | 'unknown'
+
+export interface UserUpstreamBillingAccount {
+  account_id: number
+  name: string
+  platform: string
+  provider?: UpstreamProvider | string
+  rate_multiplier?: number | null
+  rate_status?: UpstreamRateStatus
+  rate_error?: string
+  balance?: number | null
+  unit?: string
+  balance_type?: string
+  balance_source?: string
+  balance_status?: UpstreamBalanceStatus
+  balance_error?: string
+  observed_at?: string
+  updated_at?: string
+}
+
+export interface UserUpstreamBillingResponse {
+  upstream_billing: UserUpstreamBillingAccount[]
 }
 
 export type UpstreamBillingProbeStatus = 'ok' | 'unsupported' | 'failed'
 
 export interface UpstreamBillingProbeSnapshot {
   status: UpstreamBillingProbeStatus
+  provider?: UpstreamProvider
+  rate_status?: UpstreamRateStatus
+  rate_error?: string
+  balance_status?: UpstreamBalanceStatus
+  balance_error?: string
   data?: UpstreamBillingData
   received_at?: string
   fresh_until?: string
@@ -1143,6 +1188,7 @@ export interface Account {
     antigravity_credits_overages?: Record<string, { activated_at: string; active_until: string }>
     upstream_billing_probe_enabled?: boolean
     upstream_billing_rate_sync_enabled?: boolean
+    upstream_provider?: UpstreamProvider
     upstream_billing_probe?: UpstreamBillingProbeSnapshot
     codex_reset_credit_snapshot?: {
       available_count?: number

@@ -17,6 +17,8 @@ import type {
   UserAffiliateDetail,
   AffiliateTransferResponse,
   PlatformQuotasResponse,
+  UserUpstreamBillingAccount,
+  UserUpstreamBillingResponse,
 } from '@/types'
 
 /**
@@ -194,6 +196,34 @@ export async function getMyPlatformQuotas(): Promise<PlatformQuotasResponse> {
   return data
 }
 
+/**
+ * 获取当前用户按分组授权可见的上游账号倍率和余额快照。
+ * apiClient 通常已解包 { code, data }，这里同时兼容未解包和直接数组响应。
+ */
+export async function getUpstreamBilling(): Promise<UserUpstreamBillingResponse> {
+  const { data } = await apiClient.get<
+    UserUpstreamBillingResponse | UserUpstreamBillingAccount[] | { data?: UserUpstreamBillingResponse }
+  >('/user/upstream-billing')
+  const payload = data as unknown
+  if (Array.isArray(payload)) {
+    return { upstream_billing: payload as UserUpstreamBillingAccount[] }
+  }
+  if (payload && typeof payload === 'object') {
+    const record = payload as Record<string, unknown>
+    if (Array.isArray(record.upstream_billing)) {
+      return { upstream_billing: record.upstream_billing as UserUpstreamBillingAccount[] }
+    }
+    const nested = record.data
+    if (nested && typeof nested === 'object') {
+      const nestedRecord = nested as Record<string, unknown>
+      if (Array.isArray(nestedRecord.upstream_billing)) {
+        return { upstream_billing: nestedRecord.upstream_billing as UserUpstreamBillingAccount[] }
+      }
+    }
+  }
+  return { upstream_billing: [] }
+}
+
 export const userAPI = {
   getProfile,
   updateProfile,
@@ -210,6 +240,7 @@ export const userAPI = {
   getAffiliateDetail,
   transferAffiliateQuota,
   getMyPlatformQuotas,
+  getUpstreamBilling,
 }
 
 export default userAPI

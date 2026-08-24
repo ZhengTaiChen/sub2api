@@ -1024,6 +1024,18 @@
           />
           <p class="input-hint">{{ t('admin.accounts.upstream.apiKeyHint') }}</p>
         </div>
+        <div>
+          <label class="input-label">{{ t('admin.accounts.upstreamBilling.provider') }}</label>
+          <select v-model="upstreamProvider" class="input" data-testid="upstream-provider-antigravity">
+            <option value="auto">{{ t('admin.accounts.upstreamBilling.providers.auto') }}</option>
+            <option value="sub2api">{{ t('admin.accounts.upstreamBilling.providers.sub2api') }}</option>
+            <option value="new_api">{{ t('admin.accounts.upstreamBilling.providers.newApi') }}</option>
+            <option value="shuai_api">{{ t('admin.accounts.upstreamBilling.providers.shuaiApi') }}</option>
+            <option value="opencode">{{ t('admin.accounts.upstreamBilling.providers.opencode') }}</option>
+            <option value="custom">{{ t('admin.accounts.upstreamBilling.providers.custom') }}</option>
+          </select>
+          <p class="input-hint">{{ t('admin.accounts.upstreamBilling.providerHint') }}</p>
+        </div>
         <!-- 上游倍率自动探测：antigravity upstream 也是 API-key 账号 -->
         <div class="flex items-center justify-between gap-4 border-t border-gray-200 pt-4 dark:border-dark-600">
           <div>
@@ -1303,6 +1315,19 @@
             :placeholder="apiKeyValuePlaceholder"
           />
           <p v-if="apiKeyHint" class="input-hint">{{ apiKeyHint }}</p>
+        </div>
+
+        <div>
+          <label class="input-label">{{ t('admin.accounts.upstreamBilling.provider') }}</label>
+          <select v-model="upstreamProvider" class="input" data-testid="upstream-provider">
+            <option value="auto">{{ t('admin.accounts.upstreamBilling.providers.auto') }}</option>
+            <option value="sub2api">{{ t('admin.accounts.upstreamBilling.providers.sub2api') }}</option>
+            <option value="new_api">{{ t('admin.accounts.upstreamBilling.providers.newApi') }}</option>
+            <option value="shuai_api">{{ t('admin.accounts.upstreamBilling.providers.shuaiApi') }}</option>
+            <option value="opencode">{{ t('admin.accounts.upstreamBilling.providers.opencode') }}</option>
+            <option value="custom">{{ t('admin.accounts.upstreamBilling.providers.custom') }}</option>
+          </select>
+          <p class="input-hint">{{ t('admin.accounts.upstreamBilling.providerHint') }}</p>
         </div>
 
         <!-- 上游倍率自动探测：全部 API-key 平台可用（所在区块已限定 apikey 类型） -->
@@ -3744,7 +3769,8 @@ import type {
   CodexSessionImportMessage,
   OpenAICompactMode,
   OpenAIResponsesMode,
-  OpenAIEndpointCapability
+  OpenAIEndpointCapability,
+  UpstreamProvider
 } from '@/types'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
@@ -3947,6 +3973,7 @@ const accountCategory = ref<'oauth-based' | 'apikey' | 'bedrock' | 'service_acco
 const addMethod = ref<AddMethod>('oauth') // For oauth-based: 'oauth' or 'setup-token'
 const apiKeyBaseUrl = ref('https://api.anthropic.com')
 const apiKeyValue = ref('')
+const upstreamProvider = ref<UpstreamProvider>('auto')
 const upstreamBillingAutoProbeEnabled = ref(true)
 
 // ── 国产供应商（Kimi / Zhipu / DeepSeek）账号类型、API 协议与端点 ──
@@ -5022,6 +5049,7 @@ const resetForm = () => {
   adaptiveBaseUrls.value = { chat_completions: '', anthropic: '', responses: '' }
   apiKeyBaseUrl.value = 'https://api.anthropic.com'
   apiKeyValue.value = ''
+  upstreamProvider.value = 'auto'
   upstreamBillingAutoProbeEnabled.value = true
   editQuotaLimit.value = null
   editQuotaDailyLimit.value = null
@@ -5554,7 +5582,10 @@ const handleSubmit = async () => {
   }
 
   form.credentials = credentials
-  const extra = buildAnthropicExtra(buildOpenAIExtra())
+  const extra = buildAnthropicExtra(buildOpenAIExtra()) || {}
+  if (form.type === 'apikey') {
+    extra.upstream_provider = upstreamProvider.value
+  }
 
   await doCreateAccount({
     ...form,
@@ -5625,6 +5656,9 @@ const createAccountAndFinish = async (
   let finalExtra = extra
   if (type === 'apikey' || type === 'bedrock') {
     const quotaExtra: Record<string, unknown> = { ...(extra || {}) }
+    if (type === 'apikey') {
+      quotaExtra.upstream_provider = upstreamProvider.value
+    }
     if (editQuotaLimit.value != null && editQuotaLimit.value > 0) {
       quotaExtra.quota_limit = editQuotaLimit.value
     }
