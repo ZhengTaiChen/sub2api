@@ -1,5 +1,9 @@
 name: Release
 
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
 on:
   push:
     tags:
@@ -11,19 +15,30 @@ on:
         required: true
         type: string
       simple_release:
-        description: 'Simple release: only x86_64 GHCR image, skip other artifacts'
+        description: 'Compatibility alias for the fast x86_64-only release'
+        required: false
+        type: boolean
+        default: true
+      full_release:
+        description: 'Build the full multi-architecture release'
+        required: false
+        type: boolean
+        default: false
+      deploy_production:
+        description: 'Deploy the resulting GHCR image to production'
         required: false
         type: boolean
         default: false
 
-# 环境变量：合并 workflow_dispatch 输入和 repository variable
-# tag push 触发时读取 vars.SIMPLE_RELEASE，workflow_dispatch 时使用输入参数
+# 默认只构建服务器使用的 linux/amd64 镜像。设置 FULL_RELEASE=true 或在手动
+# 触发时选择 full_release 才执行完整多架构发布。
 env:
-  SIMPLE_RELEASE: ${{ github.event.inputs.simple_release == 'true' || vars.SIMPLE_RELEASE == 'true' }}
+  SIMPLE_RELEASE: ${{ github.event.inputs.full_release != 'true' && github.event.inputs.simple_release != 'false' && vars.FULL_RELEASE != 'true' }}
 
 permissions:
   contents: write
   packages: write
+  actions: write
 
 jobs:
   # Update VERSION file with tag version
@@ -60,7 +75,7 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: 9
+          version: 9.15.9
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -87,6 +102,8 @@ jobs:
   release:
     needs: [update-version, build-frontend]
     runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -117,18 +134,24 @@ jobs:
         run: |
           go version | grep -q 'go1.27.0'
 
+      - name: Download Go modules
+        working-directory: backend
+        run: go mod download
+
       # Docker setup for GoReleaser
       - name: Set up QEMU
+        if: ${{ env.SIMPLE_RELEASE != 'true' }}
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Configure GitHub Actions Docker cache
+        uses: crazy-max/ghaction-github-runtime@v3
+
       - name: Login to DockerHub
         if: ${{ env.DOCKERHUB_USERNAME != '' }}
         uses: docker/login-action@v3
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -184,6 +207,28 @@ jobs:
           GITHUB_REPO_OWNER_LOWER: ${{ steps.lowercase.outputs.owner }}
           GITHUB_REPO_NAME: ${{ github.event.repository.name }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME || 'skip' }}
+
+      - name: Resolve immutable GHCR image
+        id: image_metadata
+        shell: bash
+        env:
+          REPOSITORY_OWNER: ${{ steps.lowercase.outputs.owner }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_NAME="${{ github.event.inputs.tag }}"
+          else
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG_NAME#v}"
+          IMAGE="ghcr.io/${REPOSITORY_OWNER}/sub2api:${VERSION}"
+          DIGEST=$(docker buildx imagetools inspect "${IMAGE}" | awk '/Digest:/ {print $2; exit}')
+          test -n "${DIGEST}"
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          echo "Resolved ${IMAGE}@${DIGEST}"
 
       # Update DockerHub description
       - name: Update DockerHub description
@@ -272,6 +317,12 @@ jobs:
                 disable_web_page_preview: true
               }')"
 
+    outputs:
+      image: ${{ steps.image_metadata.outputs.image }}
+      digest: ${{ steps.image_metadata.outputs.digest }}
+      version: ${{ steps.image_metadata.outputs.version }}
+      commit: ${{ steps.image_metadata.outputs.commit }}
+
   sync-version-file:
     needs: [release]
     if: ${{ needs.release.result == 'success' }}
@@ -304,3 +355,60 @@ jobs:
           git add backend/cmd/server/VERSION
           git commit -m "chore: sync VERSION to ${VERSION} [skip ci]"
           git push origin HEAD:${{ github.event.repository.default_branch }}
+
+  deploy-production:
+    name: Deploy production
+    needs: [release]
+    if: ${{ needs.release.result == 'success' && ((github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_production == 'true') || (github.event_name == 'push' && vars.AUTO_DEPLOY_PRODUCTION == 'true')) }}
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout deployment script
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: deploy/remote-deploy.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Deploy immutable image
+        id: deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/sub2api' }}
+          IMAGE: ${{ needs.release.outputs.image }}
+          DIGEST: ${{ needs.release.outputs.digest }}
+          COMMIT: ${{ needs.release.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${DEPLOY_HOST}"
+          test -n "${DEPLOY_USER}"
+          ssh-keyscan -H "${DEPLOY_HOST}" >> "${HOME}/.ssh/known_hosts" 2>/dev/null
+          REMOTE_SCRIPT="/tmp/sub2api-remote-deploy-${GITHUB_RUN_ID}.sh"
+          scp deploy/remote-deploy.sh "${DEPLOY_USER}@${DEPLOY_HOST}:${REMOTE_SCRIPT}"
+          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" chmod 700 "${REMOTE_SCRIPT}"
+          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" bash "${REMOTE_SCRIPT}" \
+            --image "${IMAGE}" \
+            --digest "${DIGEST}" \
+            --commit "${COMMIT}" \
+            --deploy-path "${DEPLOY_PATH}"
+          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" rm -f "${REMOTE_SCRIPT}"
+
+      - name: Write deployment summary
+        run: |
+          {
+            echo '### Production deployment'
+            echo ''
+            echo '- Image: `${{ needs.release.outputs.image }}`'
+            echo '- Digest: `${{ needs.release.outputs.digest }}`'
+            echo '- Commit: `${{ needs.release.outputs.commit }}`'
+            echo '- Result: healthy'
+          } >> "${GITHUB_STEP_SUMMARY}"

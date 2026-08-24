@@ -1,0 +1,83 @@
+name: Deploy Production Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Full image reference, for example ghcr.io/wei-shaw/sub2api:0.1.180'
+        required: true
+        type: string
+      digest:
+        description: 'Immutable image digest, for example sha256:...'
+        required: true
+        type: string
+      commit:
+        description: 'Expected org.opencontainers.image.revision label'
+        required: false
+        type: string
+      deploy_path:
+        description: 'Production Compose directory'
+        required: false
+        default: '/opt/sub2api'
+        type: string
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy existing immutable image
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout deployment script
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: deploy/remote-deploy.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Deploy immutable image
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ inputs.digest }}
+          COMMIT: ${{ inputs.commit }}
+          DEPLOY_PATH: ${{ inputs.deploy_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${DEPLOY_HOST}"
+          test -n "${DEPLOY_USER}"
+          ssh-keyscan -H "${DEPLOY_HOST}" >> "${HOME}/.ssh/known_hosts" 2>/dev/null
+          remote_script="/tmp/sub2api-remote-deploy-${GITHUB_RUN_ID}.sh"
+          scp deploy/remote-deploy.sh "${DEPLOY_USER}@${DEPLOY_HOST}:${remote_script}"
+          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" chmod 700 "${remote_script}"
+          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" bash "${remote_script}" \
+            --image "${IMAGE}" \
+            --digest "${DIGEST}" \
+            --commit "${COMMIT}" \
+            --deploy-path "${DEPLOY_PATH}"
+          ssh "${DEPLOY_USER}@${DEPLOY_HOST}" rm -f "${remote_script}"
+
+      - name: Write deployment summary
+        run: |
+          commit='${{ inputs.commit }}'
+          [ -n "${commit}" ] || commit='not checked'
+          {
+            echo '### Production deployment'
+            echo ''
+            echo '- Image: `${{ inputs.image }}`'
+            echo '- Digest: `${{ inputs.digest }}`'
+            echo "- Commit: `${commit}`"
+            echo '- Result: healthy'
+          } >> "${GITHUB_STEP_SUMMARY}"
