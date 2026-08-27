@@ -196,6 +196,7 @@ export default {
         billingRateMultiplier: 'Billing Rate',
         upstreamBillingRate: 'Upstream Declared Rate',
         weight: 'Weight',
+        loadFactor: 'Scheduling Weight',
         schedulerScore: 'Scheduler Score',
         status: 'Status',
         schedulable: 'Schedulable',

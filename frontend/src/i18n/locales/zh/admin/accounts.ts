@@ -107,6 +107,7 @@ export default {
         billingRateMultiplier: '账号倍率',
         upstreamBillingRate: '上游声明倍率',
         weight: '权重',
+        loadFactor: '调度权值',
         schedulerScore: '调度权值',
         status: '状态',
         schedulable: '调度',

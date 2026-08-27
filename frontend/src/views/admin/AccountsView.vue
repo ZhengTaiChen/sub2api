@@ -378,8 +378,34 @@
               @probe="handleProbeUpstreamBilling(row)"
             />
           </template>
-          <template #cell-priority="{ value }">
-            <span class="text-sm text-gray-700 dark:text-gray-300">{{ value }}</span>
+          <template #cell-priority="{ row }">
+            <input
+              type="number"
+              class="w-20 rounded-md border border-gray-300 bg-white px-2 py-1 text-sm text-gray-700 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:opacity-60 dark:border-dark-600 dark:bg-dark-800 dark:text-gray-300"
+              min="0"
+              step="1"
+              :value="row.priority"
+              :disabled="savingInlineFields.has(`${row.id}:priority`)"
+              :title="t('admin.accounts.priorityHint')"
+              data-testid="inline-priority-input"
+              @keyup.enter="($event.target as HTMLInputElement).blur()"
+              @change="handleInlineSchedulerUpdate(row, 'priority', ($event.target as HTMLInputElement).value)"
+            />
+          </template>
+          <template #cell-load_factor="{ row }">
+            <input
+              type="number"
+              class="w-24 rounded-md border border-gray-300 bg-white px-2 py-1 text-sm text-gray-700 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:opacity-60 dark:border-dark-600 dark:bg-dark-800 dark:text-gray-300"
+              min="0"
+              max="10000"
+              step="1"
+              :value="row.load_factor ?? ''"
+              :disabled="savingInlineFields.has(`${row.id}:load_factor`)"
+              :title="t('admin.accounts.loadFactorHint')"
+              data-testid="inline-load-factor-input"
+              @keyup.enter="($event.target as HTMLInputElement).blur()"
+              @change="handleInlineSchedulerUpdate(row, 'load_factor', ($event.target as HTMLInputElement).value)"
+            />
           </template>
           <template #header-scheduler_score="{ column }">
             <div class="flex items-center">
@@ -607,6 +633,7 @@ const statsAcc = ref<Account | null>(null)
 const showSchedulePanel = ref(false)
 const scheduleAcc = ref<Account | null>(null)
 const scheduleModelOptions = ref<SelectOption[]>([])
+const savingInlineFields = reactive(new Set<string>())
 const togglingSchedulable = ref<number | null>(null)
 const menu = reactive<{show:boolean, acc:Account|null, pos:{top:number, left:number}|null}>({ show: false, acc: null, pos: null })
 const exportingData = ref(false)
@@ -1705,6 +1732,7 @@ const allColumns = computed(() => {
   c.push(
     { key: 'proxy', label: t('admin.accounts.columns.proxy'), sortable: false },
     { key: 'priority', label: t('admin.accounts.columns.priority'), sortable: true },
+    { key: 'load_factor', label: t('admin.accounts.columns.loadFactor'), sortable: true },
     { key: 'scheduler_score', label: t('admin.accounts.columns.schedulerScore'), sortable: false },
     { key: 'rate_multiplier', label: t('admin.accounts.columns.billingRateMultiplier'), sortable: true },
     { key: 'upstream_billing_rate', label: t('admin.accounts.columns.upstreamBillingRate'), sortable: true },
@@ -2178,6 +2206,31 @@ const handleProbeUpstreamBilling = async (account: Account) => {
     appStore.showError(extractApiErrorMessage(error, t('admin.accounts.upstreamBilling.probeFailed')))
   } finally {
     probingUpstreamBilling.delete(account.id)
+  }
+}
+async function handleInlineSchedulerUpdate(row: Account, field: 'priority' | 'load_factor', rawValue: string | number) {
+  const key = `${row.id}:${field}`
+  if (savingInlineFields.has(key)) return
+  if (field === 'priority' && (rawValue === '' || !Number.isInteger(Number(rawValue)) || Number(rawValue) < 0)) {
+    appStore.showError(t('admin.accounts.priorityHint'))
+    return
+  }
+  const numeric = field === 'load_factor' && rawValue === '' ? 0 : Number(rawValue)
+  if (field === 'load_factor' && (Number.isNaN(numeric) || numeric < 0 || numeric > 10000)) {
+    appStore.showError(t('admin.accounts.loadFactorHint'))
+    return
+  }
+  savingInlineFields.add(key)
+  try {
+    const updates = field === 'priority'
+      ? { priority: Number(rawValue) }
+      : { load_factor: numeric > 0 ? numeric : 0 }
+    const updated = await adminAPI.accounts.update(row.id, updates)
+    handleAccountUpdated(updated)
+  } catch (error) {
+    appStore.showError(extractApiErrorMessage(error, t('common.error')))
+  } finally {
+    savingInlineFields.delete(key)
   }
 }
 const handleAccountUpdated = (updatedAccount: Account) => {
