@@ -379,33 +379,57 @@
             />
           </template>
           <template #cell-priority="{ row }">
-            <input
-              type="number"
-              class="w-20 rounded-md border border-gray-300 bg-white px-2 py-1 text-sm text-gray-700 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:opacity-60 dark:border-dark-600 dark:bg-dark-800 dark:text-gray-300"
-              min="0"
-              step="1"
-              :value="row.priority"
-              :disabled="savingInlineFields.has(`${row.id}:priority`)"
-              :title="t('admin.accounts.priorityHint')"
-              data-testid="inline-priority-input"
-              @keyup.enter="($event.target as HTMLInputElement).blur()"
-              @change="handleInlineSchedulerUpdate(row, 'priority', ($event.target as HTMLInputElement).value)"
-            />
+            <div class="relative flex items-center">
+              <input
+                type="number"
+                class="w-20 rounded-md border border-gray-300 bg-white px-2 py-1 text-sm text-gray-700 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:cursor-wait disabled:opacity-60 dark:border-dark-600 dark:bg-dark-800 dark:text-gray-300"
+                min="0"
+                step="1"
+                :value="getInlineSchedulerValue(row, 'priority')"
+                :disabled="savingInlineFields.has(`${row.id}:priority`)"
+                :title="t('admin.accounts.priorityHint')"
+                data-testid="inline-priority-input"
+                @focus="beginInlineSchedulerEdit(row, 'priority', $event)"
+                @input="updateInlineSchedulerDraft(row, 'priority', $event)"
+                @keydown.enter.prevent="($event.target as HTMLInputElement).blur()"
+                @keydown.esc.prevent="cancelInlineSchedulerEdit(row, 'priority', $event)"
+                @blur="commitInlineSchedulerUpdate(row, 'priority', $event)"
+              />
+              <Icon
+                v-if="savingInlineFields.has(`${row.id}:priority`)"
+                name="refresh"
+                size="xs"
+                class="pointer-events-none absolute -right-5 animate-spin text-primary-500"
+                data-testid="inline-priority-saving"
+              />
+            </div>
           </template>
           <template #cell-load_factor="{ row }">
-            <input
-              type="number"
-              class="w-24 rounded-md border border-gray-300 bg-white px-2 py-1 text-sm text-gray-700 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:opacity-60 dark:border-dark-600 dark:bg-dark-800 dark:text-gray-300"
-              min="0"
-              max="10000"
-              step="1"
-              :value="row.load_factor ?? ''"
-              :disabled="savingInlineFields.has(`${row.id}:load_factor`)"
-              :title="t('admin.accounts.loadFactorHint')"
-              data-testid="inline-load-factor-input"
-              @keyup.enter="($event.target as HTMLInputElement).blur()"
-              @change="handleInlineSchedulerUpdate(row, 'load_factor', ($event.target as HTMLInputElement).value)"
-            />
+            <div class="relative flex items-center">
+              <input
+                type="number"
+                class="w-24 rounded-md border border-gray-300 bg-white px-2 py-1 text-sm text-gray-700 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:cursor-wait disabled:opacity-60 dark:border-dark-600 dark:bg-dark-800 dark:text-gray-300"
+                min="0"
+                max="10000"
+                step="1"
+                :value="getInlineSchedulerValue(row, 'load_factor')"
+                :disabled="savingInlineFields.has(`${row.id}:load_factor`)"
+                :title="t('admin.accounts.loadFactorHint')"
+                data-testid="inline-load-factor-input"
+                @focus="beginInlineSchedulerEdit(row, 'load_factor', $event)"
+                @input="updateInlineSchedulerDraft(row, 'load_factor', $event)"
+                @keydown.enter.prevent="($event.target as HTMLInputElement).blur()"
+                @keydown.esc.prevent="cancelInlineSchedulerEdit(row, 'load_factor', $event)"
+                @blur="commitInlineSchedulerUpdate(row, 'load_factor', $event)"
+              />
+              <Icon
+                v-if="savingInlineFields.has(`${row.id}:load_factor`)"
+                name="refresh"
+                size="xs"
+                class="pointer-events-none absolute -right-5 animate-spin text-primary-500"
+                data-testid="inline-load-factor-saving"
+              />
+            </div>
           </template>
           <template #header-scheduler_score="{ column }">
             <div class="flex items-center">
@@ -634,6 +658,8 @@ const showSchedulePanel = ref(false)
 const scheduleAcc = ref<Account | null>(null)
 const scheduleModelOptions = ref<SelectOption[]>([])
 const savingInlineFields = reactive(new Set<string>())
+const inlineSchedulerDrafts = reactive(new Map<string, string>())
+const cancelledInlineSchedulerEdits = reactive(new Set<string>())
 const togglingSchedulable = ref<number | null>(null)
 const menu = reactive<{show:boolean, acc:Account|null, pos:{top:number, left:number}|null}>({ show: false, acc: null, pos: null })
 const exportingData = ref(false)
@@ -2208,26 +2234,81 @@ const handleProbeUpstreamBilling = async (account: Account) => {
     probingUpstreamBilling.delete(account.id)
   }
 }
-async function handleInlineSchedulerUpdate(row: Account, field: 'priority' | 'load_factor', rawValue: string | number) {
-  const key = `${row.id}:${field}`
-  if (savingInlineFields.has(key)) return
-  if (field === 'priority' && (rawValue === '' || !Number.isInteger(Number(rawValue)) || Number(rawValue) < 0)) {
+type InlineSchedulerField = 'priority' | 'load_factor'
+
+const inlineSchedulerKey = (row: Account, field: InlineSchedulerField) => `${row.id}:${field}`
+const inlineSchedulerRowValue = (row: Account, field: InlineSchedulerField) =>
+  field === 'priority' ? String(row.priority ?? '') : String(row.load_factor ?? '')
+
+function getInlineSchedulerValue(row: Account, field: InlineSchedulerField) {
+  return inlineSchedulerDrafts.get(inlineSchedulerKey(row, field)) ?? inlineSchedulerRowValue(row, field)
+}
+
+function beginInlineSchedulerEdit(row: Account, field: InlineSchedulerField, event: Event) {
+  const key = inlineSchedulerKey(row, field)
+  cancelledInlineSchedulerEdits.delete(key)
+  inlineSchedulerDrafts.set(key, inlineSchedulerRowValue(row, field))
+  const input = event.target as HTMLInputElement
+  input.select()
+}
+
+function updateInlineSchedulerDraft(row: Account, field: InlineSchedulerField, event: Event) {
+  inlineSchedulerDrafts.set(inlineSchedulerKey(row, field), (event.target as HTMLInputElement).value)
+}
+
+function restoreInlineSchedulerInput(row: Account, field: InlineSchedulerField, event?: Event) {
+  inlineSchedulerDrafts.delete(inlineSchedulerKey(row, field))
+  if (event?.target instanceof HTMLInputElement) event.target.value = inlineSchedulerRowValue(row, field)
+}
+
+function cancelInlineSchedulerEdit(row: Account, field: InlineSchedulerField, event: Event) {
+  const key = inlineSchedulerKey(row, field)
+  cancelledInlineSchedulerEdits.add(key)
+  restoreInlineSchedulerInput(row, field, event)
+  const input = event.target as HTMLInputElement
+  input.blur()
+}
+
+async function commitInlineSchedulerUpdate(row: Account, field: InlineSchedulerField, event: Event) {
+  const key = inlineSchedulerKey(row, field)
+  if (cancelledInlineSchedulerEdits.delete(key)) return
+  const rawValue = inlineSchedulerDrafts.get(key)
+  inlineSchedulerDrafts.delete(key)
+  if (rawValue == null) return
+
+  const currentValue = inlineSchedulerRowValue(row, field)
+  const numeric = field === 'load_factor' && rawValue.trim() === '' ? 0 : Number(rawValue)
+  const currentNumeric = field === 'load_factor' && currentValue.trim() === '' ? 0 : Number(currentValue)
+  if (field === 'priority' && (rawValue.trim() === '' || !Number.isInteger(numeric) || numeric < 0)) {
     appStore.showError(t('admin.accounts.priorityHint'))
+    restoreInlineSchedulerInput(row, field, event)
     return
   }
-  const numeric = field === 'load_factor' && rawValue === '' ? 0 : Number(rawValue)
-  if (field === 'load_factor' && (Number.isNaN(numeric) || numeric < 0 || numeric > 10000)) {
+  if (field === 'load_factor' && (!Number.isFinite(numeric) || numeric < 0 || numeric > 10000)) {
     appStore.showError(t('admin.accounts.loadFactorHint'))
+    restoreInlineSchedulerInput(row, field, event)
     return
   }
+  if (Number.isFinite(currentNumeric) && numeric === currentNumeric) {
+    restoreInlineSchedulerInput(row, field, event)
+    return
+  }
+
+  await handleInlineSchedulerUpdate(row, field, numeric, event)
+}
+
+async function handleInlineSchedulerUpdate(row: Account, field: InlineSchedulerField, numeric: number, event?: Event) {
+  const key = inlineSchedulerKey(row, field)
+  if (savingInlineFields.has(key)) return
   savingInlineFields.add(key)
   try {
     const updates = field === 'priority'
-      ? { priority: Number(rawValue) }
+      ? { priority: numeric }
       : { load_factor: numeric > 0 ? numeric : 0 }
     const updated = await adminAPI.accounts.update(row.id, updates)
     handleAccountUpdated(updated)
   } catch (error) {
+    restoreInlineSchedulerInput(row, field, event)
     appStore.showError(extractApiErrorMessage(error, t('common.error')))
   } finally {
     savingInlineFields.delete(key)

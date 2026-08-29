@@ -12,6 +12,7 @@ const {
   getAllGroups,
   probeUpstreamBilling,
   probeUpstreamBillingBatch,
+  updateAccount,
   showError,
   showSuccess
 } = vi.hoisted(() => ({
@@ -23,6 +24,7 @@ const {
   getAllGroups: vi.fn(),
   probeUpstreamBilling: vi.fn(),
   probeUpstreamBillingBatch: vi.fn(),
+  updateAccount: vi.fn(),
   showError: vi.fn(),
   showSuccess: vi.fn()
 }))
@@ -39,6 +41,7 @@ vi.mock('@/api/admin', () => ({
       batchRefresh: vi.fn(),
       probeUpstreamBilling,
       probeUpstreamBillingBatch,
+      update: updateAccount,
       toggleSchedulable: vi.fn()
     },
     proxies: {
@@ -83,6 +86,8 @@ const DataTableStub = {
         <div data-test="select-row"><slot name="cell-select" :row="row" /></div>
         <slot name="cell-created_at" :value="row.created_at" :row="row" />
         <div data-test="account-rate"><slot name="cell-rate_multiplier" :row="row" /></div>
+        <div data-test="priority-cell"><slot name="cell-priority" :row="row" /></div>
+        <div data-test="load-factor-cell"><slot name="cell-load_factor" :row="row" /></div>
       </div>
     </div>
   `
@@ -133,6 +138,7 @@ describe('admin AccountsView bulk edit scope', () => {
     getAllGroups.mockReset()
     probeUpstreamBilling.mockReset()
     probeUpstreamBillingBatch.mockReset()
+    updateAccount.mockReset()
     showError.mockReset()
     showSuccess.mockReset()
 
@@ -154,6 +160,18 @@ describe('admin AccountsView bulk edit scope', () => {
     getAllGroups.mockResolvedValue([])
     probeUpstreamBilling.mockResolvedValue({})
     probeUpstreamBillingBatch.mockResolvedValue([])
+    updateAccount.mockImplementation(async (id: number, updates: Record<string, number>) => ({
+      id,
+      name: 'updated-account',
+      platform: 'openai',
+      type: 'apikey',
+      status: 'active',
+      schedulable: true,
+      priority: updates.priority ?? 1,
+      load_factor: updates.load_factor ?? 1,
+      created_at: '2026-07-13T00:00:00Z',
+      updated_at: '2026-07-13T00:00:00Z'
+    }))
   })
 
   it('opens bulk edit in filtered-results mode from the bulk actions dropdown', async () => {
@@ -268,6 +286,146 @@ describe('admin AccountsView bulk edit scope', () => {
       label: 'admin.accounts.columns.createdAt',
       sortable: true
     })
+  })
+
+  it('commits scheduler edits on blur and skips unchanged values', async () => {
+    listAccounts.mockResolvedValue({
+      items: [{
+        id: 1,
+        name: 'scheduler-account',
+        platform: 'openai',
+        type: 'apikey',
+        status: 'active',
+        schedulable: true,
+        priority: 2,
+        load_factor: 10,
+        created_at: '2026-07-13T00:00:00Z',
+        updated_at: '2026-07-13T00:00:00Z'
+      }],
+      total: 1,
+      page: 1,
+      page_size: 20,
+      pages: 1
+    })
+
+    const wrapper = mount(AccountsView, {
+      global: {
+        stubs: {
+          AppLayout: { template: '<div><slot /></div>' },
+          TablePageLayout: { template: '<div><slot name="table" /></div>' },
+          DataTable: DataTableStub,
+          Pagination: true,
+          ConfirmDialog: true,
+          AccountTableActions: true,
+          AccountTableFilters: true,
+          AccountBulkActionsBar: true,
+          AccountActionMenu: true,
+          ImportDataModal: true,
+          ReAuthAccountModal: true,
+          AccountTestModal: true,
+          AccountStatsModal: true,
+          ScheduledTestsPanel: true,
+          SyncFromCrsModal: true,
+          TempUnschedStatusModal: true,
+          ErrorPassthroughRulesModal: true,
+          TLSFingerprintProfilesModal: true,
+          CreateAccountModal: true,
+          EditAccountModal: true,
+          BulkEditAccountModal: true,
+          PlatformTypeBadge: true,
+          AccountCapacityCell: true,
+          AccountStatusIndicator: true,
+          AccountTodayStatsCell: true,
+          AccountGroupsCell: true,
+          AccountUsageCell: true,
+          UpstreamBillingRateCell: true,
+          Icon: true
+        }
+      }
+    })
+
+    await flushPromises()
+    const priority = wrapper.get('[data-testid="inline-priority-input"]')
+    await priority.trigger('focus')
+    await priority.setValue('5')
+    await priority.trigger('blur')
+    await flushPromises()
+    expect(updateAccount).toHaveBeenCalledWith(1, { priority: 5 })
+
+    updateAccount.mockClear()
+    const loadFactor = wrapper.get('[data-testid="inline-load-factor-input"]')
+    await loadFactor.trigger('focus')
+    await loadFactor.setValue('1')
+    await loadFactor.trigger('blur')
+    await flushPromises()
+    expect(updateAccount).not.toHaveBeenCalled()
+  })
+
+  it('cancels scheduler edits with Escape without sending an update', async () => {
+    listAccounts.mockResolvedValue({
+      items: [{
+        id: 1,
+        name: 'scheduler-account',
+        platform: 'openai',
+        type: 'apikey',
+        status: 'active',
+        schedulable: true,
+        priority: 2,
+        load_factor: 10,
+        created_at: '2026-07-13T00:00:00Z',
+        updated_at: '2026-07-13T00:00:00Z'
+      }],
+      total: 1,
+      page: 1,
+      page_size: 20,
+      pages: 1
+    })
+
+    const wrapper = mount(AccountsView, {
+      global: {
+        stubs: {
+          AppLayout: { template: '<div><slot /></div>' },
+          TablePageLayout: { template: '<div><slot name="table" /></div>' },
+          DataTable: DataTableStub,
+          Pagination: true,
+          ConfirmDialog: true,
+          AccountTableActions: true,
+          AccountTableFilters: true,
+          AccountBulkActionsBar: true,
+          AccountActionMenu: true,
+          ImportDataModal: true,
+          ReAuthAccountModal: true,
+          AccountTestModal: true,
+          AccountStatsModal: true,
+          ScheduledTestsPanel: true,
+          SyncFromCrsModal: true,
+          TempUnschedStatusModal: true,
+          ErrorPassthroughRulesModal: true,
+          TLSFingerprintProfilesModal: true,
+          CreateAccountModal: true,
+          EditAccountModal: true,
+          BulkEditAccountModal: true,
+          PlatformTypeBadge: true,
+          AccountCapacityCell: true,
+          AccountStatusIndicator: true,
+          AccountTodayStatsCell: true,
+          AccountGroupsCell: true,
+          AccountUsageCell: true,
+          UpstreamBillingRateCell: true,
+          Icon: true
+        }
+      }
+    })
+
+    await flushPromises()
+    const loadFactor = wrapper.get('[data-testid="inline-load-factor-input"]')
+    await loadFactor.trigger('focus')
+    await loadFactor.setValue('99')
+    await loadFactor.trigger('keydown.esc')
+    await flushPromises()
+
+    expect(updateAccount).not.toHaveBeenCalled()
+    expect((loadFactor.element as HTMLInputElement).value).toBe('10')
   })
 
   it('passes the loaded global probe state to every upstream billing cell', async () => {
