@@ -51,6 +51,8 @@ OVERRIDE_FILE=$STATE_DIR/compose.deploy.yml
 ROLLBACK_FILE=$STATE_DIR/compose.rollback.yml
 LOG_FILE=$STATE_DIR/deploy.log
 IMAGE_REF=$IMAGE@$DIGEST
+RUNTIME_IMAGE_REF=$IMAGE_REF
+PERSISTED_IMAGE_REF=$IMAGE_REF
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 BACKUP_FILE=$STATE_DIR/docker-compose.yml.before-$STAMP
 PERSISTED=0
@@ -86,23 +88,32 @@ old_image=$(docker inspect sub2api --format '{{.Config.Image}}' 2>/dev/null || t
 old_id=$(docker inspect sub2api --format '{{.Image}}' 2>/dev/null || true)
 
 if [ "$SKIP_PULL" -eq 1 ]; then
-  log "using locally loaded image $IMAGE_REF"
-  docker image inspect "$IMAGE_REF" >/dev/null 2>&1 || die 'locally loaded image is not available; current service was not changed'
+  if docker image inspect "$IMAGE_REF" >/dev/null 2>&1; then
+    log "using locally loaded immutable image $IMAGE_REF"
+  elif docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    # docker load may restore a version tag without RepoDigests. The release
+    # tag is unique; retain the requested digest in deployment state below.
+    RUNTIME_IMAGE_REF=$IMAGE
+    PERSISTED_IMAGE_REF=$IMAGE
+    log "using locally loaded tagged image $IMAGE (digest $DIGEST)"
+  else
+    die 'locally loaded image is not available; current service was not changed'
+  fi
 else
   log "pulling $IMAGE_REF"
   docker pull "$IMAGE_REF" >/dev/null || die 'docker pull failed; current service was not changed'
 fi
 
-arch=$(docker image inspect "$IMAGE_REF" --format '{{.Architecture}}' 2>/dev/null || true)
+arch=$(docker image inspect "$RUNTIME_IMAGE_REF" --format '{{.Architecture}}' 2>/dev/null || true)
 [ "$arch" = "$EXPECTED_ARCH" ] || die "image architecture is $arch, expected $EXPECTED_ARCH"
 
 if [ -n "$COMMIT" ]; then
-  image_commit=$(docker image inspect "$IMAGE_REF" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)
+  image_commit=$(docker image inspect "$RUNTIME_IMAGE_REF" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null || true)
   [ "$image_commit" = "$COMMIT" ] || die "image commit is $image_commit, expected $COMMIT"
 fi
 
 cp "$COMPOSE_FILE" "$BACKUP_FILE"
-printf '%s\n' 'services:' '  sub2api:' "    image: $IMAGE_REF" > "$OVERRIDE_FILE"
+printf '%s\n' 'services:' '  sub2api:' "    image: $RUNTIME_IMAGE_REF" > "$OVERRIDE_FILE"
 
 docker compose -f "$COMPOSE_FILE" -f "$OVERRIDE_FILE" config -q || die 'deployment compose configuration is invalid'
 
@@ -165,7 +176,7 @@ fi
 # The original file is retained as a rollback artifact.
 rm -f "$OVERRIDE_FILE"
 mv "$BACKUP_FILE" "$BACKUP_FILE.tmp"
-awk -v image="$IMAGE_REF" '
+awk -v image="$PERSISTED_IMAGE_REF" '
   /^[[:space:]]*sub2api:[[:space:]]*$/ { in_service=1; print; next }
   in_service && $0 ~ /^[^[:space:]]/ { in_service=0 }
   in_service && !done && $0 ~ /^[[:space:]]+image:[[:space:]]*/ {
@@ -180,10 +191,11 @@ mv "$BACKUP_FILE.tmp" "$BACKUP_FILE" 2>/dev/null || true
 PERSISTED=1
 
 docker compose -f "$COMPOSE_FILE" config -q || { rollback; die 'persisted compose configuration is invalid'; }
-printf '%s\n' "$IMAGE_REF" > "$STATE_DIR/current-image"
+printf '%s\n' "$PERSISTED_IMAGE_REF" > "$STATE_DIR/current-image"
+printf '%s\n' "$DIGEST" > "$STATE_DIR/current-digest"
 printf '%s\n' "${old_image:-}" > "$STATE_DIR/previous-image"
 printf '%s\n' "$COMMIT" > "$STATE_DIR/current-commit"
-log "deployment succeeded: $IMAGE_REF container=$container_id docker_health=$health"
+log "deployment succeeded: $PERSISTED_IMAGE_REF digest=$DIGEST container=$container_id docker_health=$health"
 
 # Retain only the newest compose backup for manual rollback.
 for backup in $(find "$STATE_DIR" -maxdepth 1 -type f -name 'docker-compose.yml.before-*' -print | sort); do

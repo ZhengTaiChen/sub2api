@@ -49,7 +49,10 @@ deploy/remote-deploy.sh \
   --deploy-path /opt/sub2api
 ```
 
-The local image is still inspected for the requested immutable reference,
-architecture, and OCI revision before the container is changed.
+The local image is still inspected for the requested architecture and OCI
+revision before the container is changed. A `docker load` archive may restore
+only the unique release tag and not a local `RepoDigest`; in that case the
+script uses the tag for the running container and records the requested digest
+under `.deploy/current-digest`.
 
 Deployment state and logs are stored under `/opt/sub2api/.deploy`. The newest Compose backup and previous image reference are retained for rollback.

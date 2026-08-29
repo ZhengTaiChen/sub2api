@@ -32,7 +32,7 @@ mode=${FAKE_DOCKER_MODE:-success}
 case "$1" in
   compose) [ "${2:-}" = version ] && { echo 'Docker Compose version v2'; exit 0; }; [ "$mode" = compose-fail ] && exit 1; exit 0 ;;
   pull) [ "$mode" = no-pull ] && exit 1; exit 0 ;;
-  image) case "$*" in *inspect*) case "$*" in *Architecture*) echo amd64 ;; *revision*) echo commit-test ;; esac ;; esac; exit 0 ;;
+  image) if [ "$mode" = no-pull ] && case "$*" in *@sha256:*) true ;; *) false ;; esac; then exit 1; fi; case "$*" in *inspect*) case "$*" in *Architecture*) echo amd64 ;; *revision*) echo commit-test ;; esac ;; esac; exit 0 ;;
   inspect) case "$*" in *Config.Image*) echo old/image:stable ;; *Health.Status*) [ "$mode" = unhealthy ] && echo unhealthy || echo healthy ;; *'{{.Image}}'*) echo old-image-id ;; *'{{.Id}}'*) echo new-container-id ;; esac; exit 0 ;;
   port) echo '0.0.0.0:18080' ;;
   logs) exit 0 ;;
@@ -57,6 +57,7 @@ fi
 cmp "$tmp_dir/app/docker-compose.yml" "$tmp_dir/app/docker-compose.yml.success"
 
 PATH="$fake_bin:$PATH" FAKE_DOCKER_MODE=no-pull "$script" --image example/sub2api:1.0 --digest sha256:0000000000000000000000000000000000000000000000000000000000000000 --commit commit-test --skip-pull --deploy-path "$tmp_dir/app" >/dev/null
-grep -Fq 'example/sub2api:1.0@sha256:' "$tmp_dir/app/docker-compose.yml"
+grep -Fq 'image: example/sub2api:1.0' "$tmp_dir/app/docker-compose.yml"
+grep -Fq 'sha256:0000000000000000000000000000000000000000000000000000000000000000' "$tmp_dir/app/.deploy/current-digest"
 
 printf 'remote deploy script test passed\n'
