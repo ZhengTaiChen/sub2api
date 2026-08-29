@@ -6,7 +6,7 @@
 set -eu
 
 usage() {
-  printf '%s\n' "Usage: $0 --image IMAGE --digest sha256:... [--commit COMMIT] [--deploy-path PATH]" >&2
+  printf '%s\n' "Usage: $0 --image IMAGE --digest sha256:... [--commit COMMIT] [--deploy-path PATH] [--skip-pull]" >&2
   exit 2
 }
 
@@ -16,6 +16,7 @@ COMMIT=
 DEPLOY_PATH=/opt/sub2api
 HEALTH_TIMEOUT=${DEPLOY_HEALTH_TIMEOUT:-60}
 EXPECTED_ARCH=${DEPLOY_ARCH:-amd64}
+SKIP_PULL=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -24,6 +25,7 @@ while [ $# -gt 0 ]; do
     --commit) [ $# -ge 2 ] || usage; COMMIT=$2; shift 2 ;;
     --deploy-path) [ $# -ge 2 ] || usage; DEPLOY_PATH=$2; shift 2 ;;
     --health-timeout) [ $# -ge 2 ] || usage; HEALTH_TIMEOUT=$2; shift 2 ;;
+    --skip-pull) SKIP_PULL=1; shift ;;
     *) usage ;;
   esac
 done
@@ -83,8 +85,13 @@ fi
 old_image=$(docker inspect sub2api --format '{{.Config.Image}}' 2>/dev/null || true)
 old_id=$(docker inspect sub2api --format '{{.Image}}' 2>/dev/null || true)
 
-log "pulling $IMAGE_REF"
-docker pull "$IMAGE_REF" >/dev/null || die 'docker pull failed; current service was not changed'
+if [ "$SKIP_PULL" -eq 1 ]; then
+  log "using locally loaded image $IMAGE_REF"
+  docker image inspect "$IMAGE_REF" >/dev/null 2>&1 || die 'locally loaded image is not available; current service was not changed'
+else
+  log "pulling $IMAGE_REF"
+  docker pull "$IMAGE_REF" >/dev/null || die 'docker pull failed; current service was not changed'
+fi
 
 arch=$(docker image inspect "$IMAGE_REF" --format '{{.Architecture}}' 2>/dev/null || true)
 [ "$arch" = "$EXPECTED_ARCH" ] || die "image architecture is $arch, expected $EXPECTED_ARCH"

@@ -36,4 +36,20 @@ deploy/remote-deploy.sh \
 
 The script pulls and validates the image, starts it through a temporary Compose override, waits for Docker health and `/health`, and only then persists the digest-pinned image in the production Compose file. Failure restores the previous Compose configuration and starts the previous container.
 
+When the image has already been transferred to the server and imported with
+`docker load`, pass `--skip-pull` to avoid contacting the registry:
+
+```sh
+docker load -i /tmp/sub2api-0.1.183-b745cfd5e.tar
+deploy/remote-deploy.sh \
+  --image ghcr.io/zhengtaichen/sub2api:0.1.183 \
+  --digest sha256:<64-hex-digest> \
+  --commit b745cfd5e \
+  --skip-pull \
+  --deploy-path /opt/sub2api
+```
+
+The local image is still inspected for the requested immutable reference,
+architecture, and OCI revision before the container is changed.
+
 Deployment state and logs are stored under `/opt/sub2api/.deploy`. The newest Compose backup and previous image reference are retained for rollback.
