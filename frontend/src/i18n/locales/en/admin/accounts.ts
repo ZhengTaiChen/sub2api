@@ -286,6 +286,7 @@ export default {
         updatedAt: 'Updated: {value}',
         rateSource: 'Rate source: {value}',
         balance: 'Balance: {value}',
+        balanceWithStatus: 'Balance: {value} ({status})',
         balanceUnknown: 'Balance: unknown',
         balanceLow: 'Low balance',
         balanceExpired: 'Balance expired',

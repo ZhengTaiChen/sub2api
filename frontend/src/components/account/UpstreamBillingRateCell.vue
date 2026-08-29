@@ -1,13 +1,23 @@
 <template>
-  <div v-if="eligible" class="flex h-6 min-w-[7rem] items-center gap-1">
+  <div v-if="eligible" class="flex min-h-10 min-w-[8rem] items-center gap-1">
     <HelpTooltip class="-ml-1" width-class="w-max max-w-[calc(100vw-2rem)]" data-testid="upstream-billing-details">
       <template #trigger>
-        <span
-          class="cursor-help border-b border-dotted border-gray-300 text-sm font-medium dark:border-dark-600"
-          :class="hasEffectiveRate ? 'font-mono text-gray-800 dark:text-gray-200' : statusClass || 'text-gray-400 dark:text-gray-500'"
-          data-testid="upstream-billing-rate"
-        >
-          {{ primaryValue }}
+        <span class="flex cursor-help flex-col border-b border-dotted border-gray-300 leading-tight dark:border-dark-600">
+          <span
+            class="text-sm font-medium"
+            :class="hasEffectiveRate ? 'font-mono text-gray-800 dark:text-gray-200' : statusClass || 'text-gray-400 dark:text-gray-500'"
+            data-testid="upstream-billing-rate"
+          >
+            {{ primaryValue }}
+          </span>
+          <span
+            class="mt-0.5 max-w-40 truncate text-[10px] font-medium"
+            :class="balanceVisibleClass"
+            :title="balanceVisibleText"
+            data-testid="upstream-billing-balance-visible"
+          >
+            {{ balanceVisibleText }}
+          </span>
         </span>
       </template>
       <div class="space-y-1">
@@ -255,6 +265,22 @@ const balanceStatusLabel = computed(() => {
     return t('admin.accounts.upstreamBilling.balanceUnknown')
   }
   return ''
+})
+const balanceVisibleText = computed(() => {
+  if (balanceValue.value == null) return t('admin.accounts.upstreamBilling.balanceUnknown')
+  if (balanceStatusLabel.value) {
+    return t('admin.accounts.upstreamBilling.balanceWithStatus', {
+      value: balanceText.value,
+      status: balanceStatusLabel.value
+    })
+  }
+  return t('admin.accounts.upstreamBilling.balance', { value: balanceText.value })
+})
+const balanceVisibleClass = computed(() => {
+  if (balanceValue.value != null && balanceValue.value <= 0) return 'text-red-600 dark:text-red-400'
+  if (balanceExpired.value) return 'text-amber-600 dark:text-amber-400'
+  if (balanceValue.value == null) return 'text-gray-400 dark:text-gray-500'
+  return 'text-gray-500 dark:text-gray-400'
 })
 const elapsedSinceLastSuccess = computed(() => {
   if (!Number.isFinite(receivedAt.value)) return '-'

@@ -128,6 +128,9 @@ describe('UpstreamBillingRateCell', () => {
       }
     })
     expect(wrapper.get('[data-testid="upstream-billing-rate"]').text()).toBe('0.50x')
+    expect(wrapper.get('[data-testid="upstream-billing-balance-visible"]').text()).toBe(
+      'admin.accounts.upstreamBilling.balance:12.5 USD'
+    )
     await wrapper.get('[data-testid="upstream-billing-details"]').trigger('mouseenter')
     await flushPromises()
     const tooltips = document.body.querySelectorAll('[role="tooltip"]')
@@ -135,6 +138,67 @@ describe('UpstreamBillingRateCell', () => {
     expect(tooltip.textContent).toContain('admin.accounts.upstreamBilling.rateSource:admin.accounts.upstreamBilling.shuaiApiUsage')
     expect(tooltip.textContent).toContain('admin.accounts.upstreamBilling.balance:12.5 USD')
     wrapper.unmount()
+  })
+
+  it('keeps balance visible in the account list for low, expired, and unknown states', async () => {
+    const wrapper = mount(UpstreamBillingRateCell, {
+      props: {
+        account: makeAccount({
+          extra: {
+            upstream_billing_probe: {
+              status: 'ok',
+              balance_status: 'ok',
+              data: { ...billingData, balance: 0, unit: 'USD' },
+              received_at: '2026-07-13T00:00:00Z',
+              fresh_until: '2026-07-14T00:00:00Z',
+              last_attempt_at: '2026-07-13T00:00:00Z',
+              next_probe_at: '2026-07-13T00:30:00Z'
+            }
+          }
+        }),
+        now: Date.now()
+      }
+    })
+
+    const balance = wrapper.get('[data-testid="upstream-billing-balance-visible"]')
+    expect(balance.text()).toContain('0 USD')
+    expect(balance.text()).toContain('admin.accounts.upstreamBilling.balanceWithStatus:0 USD,admin.accounts.upstreamBilling.balanceLow')
+    expect(balance.classes()).toContain('text-red-600')
+
+    await wrapper.setProps({
+      account: makeAccount({
+        extra: {
+          upstream_billing_probe: {
+            status: 'failed',
+            balance_status: 'failed',
+            data: { ...billingData, balance: 4.5, unit: 'USD' },
+            received_at: '2026-07-13T00:00:00Z',
+            fresh_until: '2026-07-14T00:00:00Z',
+            last_attempt_at: '2026-07-13T00:00:00Z',
+            next_probe_at: '2026-07-13T00:30:00Z',
+            last_error: 'balance_unavailable'
+          }
+        }
+      })
+    })
+    expect(balance.text()).toContain('4.5 USD')
+    expect(balance.text()).toContain('admin.accounts.upstreamBilling.balanceWithStatus:4.5 USD,admin.accounts.upstreamBilling.balanceExpired')
+    expect(balance.classes()).toContain('text-amber-600')
+
+    await wrapper.setProps({
+      account: makeAccount({
+        extra: {
+          upstream_billing_probe: {
+            status: 'unsupported',
+            balance_status: 'unknown',
+            last_attempt_at: '2026-07-13T00:00:00Z',
+            next_probe_at: '2026-07-13T00:30:00Z'
+          }
+        }
+      })
+    })
+    expect(balance.text()).toBe('admin.accounts.upstreamBilling.balanceUnknown')
+    expect(balance.classes()).toContain('text-gray-400')
   })
 
   it('uses retained failed data only while it is still fresh', async () => {

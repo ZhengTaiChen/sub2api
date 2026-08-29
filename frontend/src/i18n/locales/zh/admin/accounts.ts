@@ -197,6 +197,7 @@ export default {
         updatedAt: '更新时间：{value}',
         rateSource: '倍率来源：{value}',
         balance: '余额：{value}',
+        balanceWithStatus: '余额：{value}（{status}）',
         balanceUnknown: '余额：未知',
         balanceLow: '低余额',
         balanceExpired: '余额已过期',
