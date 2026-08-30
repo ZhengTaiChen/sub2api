@@ -283,6 +283,72 @@ func TestUpstreamOpenAIBillingParsing(t *testing.T) {
 	require.False(t, ok)
 }
 
+func upstreamBillingProbeResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func upstreamBillingProbeAPIKeyAccount(id int64) *Account {
+	return &Account{
+		ID:          id,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Concurrency: 1,
+		Credentials: map[string]any{"api_key": "sk-test", "base_url": "https://upstream.example/v1"},
+		Extra:       map[string]any{UpstreamBillingProbeEnabledExtraKey: true},
+	}
+}
+
+func TestUpstreamBillingProbeAcceptsExplicitDashboardBalanceWithoutSiblingEndpoint(t *testing.T) {
+	account := upstreamBillingProbeAPIKeyAccount(24)
+	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{account.ID: account}}
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		upstreamBillingProbeResponse(http.StatusOK, `{
+			"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token",
+			"group_rate_multiplier":0.8,"resolved_rate_multiplier":0.8,"peak_rate_enabled":false,
+			"effective_rate_multiplier":0.8,"observed_at":"2026-07-13T01:00:00Z"
+		}`),
+		upstreamBillingProbeResponse(http.StatusNotFound, `{}`),
+		upstreamBillingProbeResponse(http.StatusOK, `{"data":{"available_balance":"12.5","currency":"USD"}}`),
+		upstreamBillingProbeResponse(http.StatusBadGateway, `{}`),
+	}}
+
+	snapshot, err := newUpstreamBillingProbeTestService(repo, upstream, &upstreamBillingProbeSettingRepo{}).
+		ProbeAccount(context.Background(), account.ID)
+
+	require.NoError(t, err)
+	require.Equal(t, UpstreamBillingProbeStatusOK, snapshot.Status)
+	require.Equal(t, UpstreamBillingProbeStatusOK, snapshot.RateStatus)
+	require.Equal(t, UpstreamBillingProbeStatusOK, snapshot.BalanceStatus)
+	require.Equal(t, 12.5, snapshot.Data[UpstreamBalanceExtraKey])
+	require.Equal(t, "USD", snapshot.Data[UpstreamBalanceUnitExtraKey])
+	require.Equal(t, "dashboard_billing", snapshot.Data[UpstreamBalanceSourceExtraKey])
+}
+
+func TestUpstreamBillingProbeCalculatesNegativeDashboardBalanceWhenRateUnsupported(t *testing.T) {
+	account := upstreamBillingProbeAPIKeyAccount(25)
+	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{account.ID: account}}
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		upstreamBillingProbeResponse(http.StatusNotFound, `{}`),
+		upstreamBillingProbeResponse(http.StatusNotFound, `{}`),
+		upstreamBillingProbeResponse(http.StatusOK, `{"hard_limit_usd":12.5}`),
+		upstreamBillingProbeResponse(http.StatusOK, `{"total_usage":1300}`),
+	}}
+
+	snapshot, err := newUpstreamBillingProbeTestService(repo, upstream, &upstreamBillingProbeSettingRepo{}).
+		ProbeAccount(context.Background(), account.ID)
+
+	require.NoError(t, err)
+	require.Equal(t, UpstreamBillingProbeStatusOK, snapshot.Status)
+	require.Equal(t, UpstreamBillingProbeStatusUnsupported, snapshot.RateStatus)
+	require.Equal(t, UpstreamBillingProbeStatusOK, snapshot.BalanceStatus)
+	require.Equal(t, -0.5, snapshot.Data[UpstreamBalanceExtraKey])
+}
+
 func TestShuaiAPIUsageInvalidRateDoesNotInvalidateBalance(t *testing.T) {
 	data, err := parseShuaiAPIUsageResponse([]byte(`{"code":true,"data":{"object":"token_usage","display":{"remaining":3.25},"rate_multiplier":"not-a-number"}}`))
 	require.NoError(t, err)
@@ -294,6 +360,23 @@ func TestShuaiAPIUsageInvalidRateDoesNotInvalidateBalance(t *testing.T) {
 	require.Error(t, err)
 	_, err = parseShuaiAPIUsageResponse([]byte(`{"code":true,"data":{"object":"other"}}`))
 	require.Error(t, err)
+}
+
+func TestShuaiAPIFreshnessFollowsProbeInterval(t *testing.T) {
+	account := upstreamBillingProbeAPIKeyAccount(26)
+	account.Credentials["provider"] = UpstreamProviderShuai
+	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{account.ID: account}}
+	upstream := &httpUpstreamRecorder{resp: upstreamBillingProbeResponse(http.StatusOK, `{
+		"code":true,"data":{"object":"token_usage","display":{"remaining":3.25},"rate_multiplier":0.5}
+	}`)}
+	svc := newUpstreamBillingProbeTestService(repo, upstream, &upstreamBillingProbeSettingRepo{})
+	now := time.Date(2026, time.July, 13, 2, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	snapshot, err := svc.probeAccount(context.Background(), account.ID, 30)
+	require.NoError(t, err)
+	require.NotNil(t, snapshot.FreshUntil)
+	require.Equal(t, now.Add(time.Hour), *snapshot.FreshUntil)
 }
 
 func TestUpstreamBillingProbeSettingsDefaultsAndValidation(t *testing.T) {

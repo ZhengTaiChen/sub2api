@@ -707,7 +707,11 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		HTTPStatus:    rateHTTPStatus,
 	}
 	if shuaiAPI {
-		snapshot.FreshUntil = probeTimePtr(now.Add(upstreamBillingShuaiFreshTTL))
+		freshTTL := 2 * time.Duration(intervalMinutes) * time.Minute
+		if freshTTL < upstreamBillingShuaiFreshTTL {
+			freshTTL = upstreamBillingShuaiFreshTTL
+		}
+		snapshot.FreshUntil = probeTimePtr(now.Add(freshTTL))
 	}
 	if topStatus == UpstreamBillingProbeStatusUnsupported {
 		snapshot.LastError = "unsupported"
@@ -1101,7 +1105,11 @@ func findUpstreamUsageBalance(response map[string]any) (float64, map[string]any,
 		if candidate == nil {
 			continue
 		}
-		if balance, ok := firstUsageBalanceValue(candidate, "remaining", "balance", "available_balance", "total_available", "total_balance", "credit"); ok {
+		if balance, ok := firstUsageBalanceValue(candidate,
+			"remaining", "balance", "available_balance", "total_available",
+			"total_balance", "credit", "quota_remaining", "remaining_balance",
+			"subscription_balance", "credit_balance", "available",
+		); ok {
 			return balance, candidate, true
 		}
 		for _, key := range []string{"data", "quota", "usage", "subscription"} {
@@ -1254,25 +1262,62 @@ func (s *UpstreamBillingProbeService) probeBalanceForAccount(
 			return result, UpstreamBillingProbeStatusOK, ""
 		}
 	}
+	// Some relays expose a usable balance envelope at /v1/usage but return a
+	// non-2xx status for one of their legacy billing routes. Keep the probes
+	// independent: a valid dashboard response must not be discarded because a
+	// sibling endpoint is missing.
 	subscriptionURL := buildOpenAIEndpointURL(baseURL, "/v1/dashboard/billing/subscription")
 	subscriptionBody, subscriptionStatus, _, subErr := s.upstreamBalanceProbeGET(ctx, account, subscriptionURL, proxyURL, tlsProfile, false)
 	startDate := now.UTC().Format("2006-01") + "-01"
 	endDate := now.UTC().Format("2006-01-02")
 	usageDashboardURL := buildOpenAIEndpointURL(baseURL, "/v1/dashboard/billing/usage") + "?start_date=" + url.QueryEscape(startDate) + "&end_date=" + url.QueryEscape(endDate)
 	usageBody, usageDashboardStatus, _, usageErr := s.upstreamBalanceProbeGET(ctx, account, usageDashboardURL, proxyURL, tlsProfile, false)
+	// Prefer explicit balance fields from either dashboard response. This is
+	// supported by several new-api forks and avoids requiring both legacy
+	// OpenAI billing endpoints to exist.
+	for _, candidate := range []struct {
+		body   []byte
+		status int
+	}{
+		{body: subscriptionBody, status: subscriptionStatus},
+		{body: usageBody, status: usageDashboardStatus},
+	} {
+		if candidate.status < 200 || candidate.status >= 300 {
+			continue
+		}
+		if len(candidate.body) == 0 {
+			continue
+		}
+		if balance, unit, balanceType, ok := parseUpstreamUsageBalance(candidate.body); ok {
+			upstreamBalanceSnapshotData(result, balance, unit, balanceType, "dashboard_billing", now)
+			return result, UpstreamBillingProbeStatusOK, ""
+		}
+	}
 	if subErr == nil && usageErr == nil {
 		if limit, ok := parseUpstreamOpenAIBilling(subscriptionBody); ok {
 			if usageCents, usageOK := parseUpstreamOpenAIUsage(usageBody); usageOK {
 				balance := limit - usageCents/100
+				if math.IsNaN(balance) || math.IsInf(balance, 0) {
+					return result, UpstreamBillingProbeStatusFailed, "invalid_response"
+				}
 				upstreamBalanceSnapshotData(result, balance, "USD", "subscription", "openai_dashboard", now)
 				return result, UpstreamBillingProbeStatusOK, ""
 			}
 		}
 	}
-	if usageErr != nil || subErr != nil {
-		return result, UpstreamBillingProbeStatusFailed, "request_failed"
-	} else if isUnsupportedUpstreamStatus(usageStatus) && isUnsupportedUpstreamStatus(subscriptionStatus) && isUnsupportedUpstreamStatus(usageDashboardStatus) {
+	statuses := []int{usageStatus, subscriptionStatus, usageDashboardStatus}
+	allUnsupported := true
+	for _, status := range statuses {
+		if !isUnsupportedUpstreamStatus(status) {
+			allUnsupported = false
+			break
+		}
+	}
+	if allUnsupported {
 		return result, UpstreamBillingProbeStatusUnsupported, "unsupported_balance"
+	}
+	if err != nil || subErr != nil || usageErr != nil {
+		return result, UpstreamBillingProbeStatusFailed, "request_failed"
 	} else {
 		return result, UpstreamBillingProbeStatusFailed, "invalid_response"
 	}

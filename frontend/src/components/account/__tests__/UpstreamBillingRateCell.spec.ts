@@ -201,6 +201,33 @@ describe('UpstreamBillingRateCell', () => {
     expect(balance.classes()).toContain('text-gray-400')
   })
 
+  it('does not present a retained rate as current when only the balance probe succeeded', () => {
+    const wrapper = mount(UpstreamBillingRateCell, {
+      props: {
+        account: makeAccount({
+          extra: {
+            upstream_billing_probe: {
+              status: 'ok',
+              rate_status: 'unsupported',
+              balance_status: 'ok',
+              data: { ...billingData, balance: 6.5, unit: 'USD' },
+              received_at: '2026-07-13T00:00:00Z',
+              fresh_until: '2026-07-14T00:00:00Z',
+              last_attempt_at: '2026-07-13T00:00:00Z',
+              next_probe_at: '2026-07-13T00:30:00Z'
+            }
+          }
+        }),
+        now: Date.now()
+      }
+    })
+
+    expect(wrapper.get('[data-testid="upstream-billing-rate"]').text()).toBe(
+      'admin.accounts.upstreamBilling.unsupported'
+    )
+    expect(wrapper.get('[data-testid="upstream-billing-balance-visible"]').text()).toContain('6.5 USD')
+  })
+
   it('uses retained failed data only while it is still fresh', async () => {
     const account = makeAccount({
       extra: {

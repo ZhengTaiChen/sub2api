@@ -558,7 +558,7 @@ describe('admin AccountsView bulk edit scope', () => {
     expect(probeUpstreamBillingBatch).toHaveBeenCalledWith([7, 11])
   })
 
-  it('refreshes the current page after a batch probe and displays the synced rate', async () => {
+  it('patches the current page after a batch probe without reloading the list', async () => {
     const account = (id: number, rateMultiplier: number) => ({
       id,
       name: `account-${id}`,
@@ -573,12 +573,12 @@ describe('admin AccountsView bulk edit scope', () => {
     listAccounts
       .mockResolvedValueOnce({ items: [account(7, 0.25)], total: 2, page: 1, page_size: 1, pages: 2 })
       .mockResolvedValueOnce({ items: [account(11, 0.25)], total: 2, page: 2, page_size: 1, pages: 2 })
-      .mockResolvedValueOnce({ items: [account(11, 0.065)], total: 2, page: 2, page_size: 1, pages: 2 })
     probeUpstreamBillingBatch.mockResolvedValue([
       {
         account_id: 11,
         snapshot: {
           status: 'ok',
+          synced_rate_multiplier: 0.065,
           data: { effective_rate_multiplier: 0.065 },
           last_attempt_at: '2026-07-13T00:00:00Z',
           next_probe_at: '2026-07-13T00:30:00Z'
@@ -629,12 +629,11 @@ describe('admin AccountsView bulk edit scope', () => {
     await flushPromises()
 
     expect(probeUpstreamBillingBatch).toHaveBeenCalledWith([11])
-    expect(listAccounts).toHaveBeenCalledTimes(3)
-    expect(listAccounts.mock.calls[2]?.[0]).toBe(2)
+    expect(listAccounts).toHaveBeenCalledTimes(2)
     expect(wrapper.get('[data-test="account-rate"]').text()).toBe('0.065x')
   })
 
-  it('does not report a successful batch probe as failed when the list refresh fails', async () => {
+  it('does not require a list refresh after a successful batch probe', async () => {
     const account = {
       id: 7,
       name: 'account-7',
@@ -646,14 +645,13 @@ describe('admin AccountsView bulk edit scope', () => {
       created_at: '2026-07-13T00:00:00Z',
       updated_at: '2026-07-13T00:00:00Z'
     }
-    listAccounts
-      .mockResolvedValueOnce({ items: [account], total: 1, page: 1, page_size: 20, pages: 1 })
-      .mockRejectedValueOnce(new Error('refresh failed'))
+    listAccounts.mockResolvedValueOnce({ items: [account], total: 1, page: 1, page_size: 20, pages: 1 })
     probeUpstreamBillingBatch.mockResolvedValue([
       {
         account_id: 7,
         snapshot: {
           status: 'ok',
+          synced_rate_multiplier: 0.065,
           data: { effective_rate_multiplier: 0.065 },
           last_attempt_at: '2026-07-13T00:00:00Z',
           next_probe_at: '2026-07-13T00:30:00Z'
@@ -707,7 +705,7 @@ describe('admin AccountsView bulk edit scope', () => {
     consoleError.mockRestore()
   })
 
-  it('refreshes the account row after a successful single-account probe', async () => {
+  it('patches the account row after a successful single-account probe without reloading the list', async () => {
     const account = (rateMultiplier: number) => ({
       id: 7,
       name: 'account-7',
@@ -720,13 +718,12 @@ describe('admin AccountsView bulk edit scope', () => {
       created_at: '2026-07-13T00:00:00Z',
       updated_at: '2026-07-13T00:00:00Z'
     })
-    listAccounts
-      .mockResolvedValueOnce({ items: [account(0.25)], total: 1, page: 1, page_size: 20, pages: 1 })
-      .mockResolvedValueOnce({ items: [account(0.065)], total: 1, page: 1, page_size: 20, pages: 1 })
+    listAccounts.mockResolvedValueOnce({ items: [account(0.25)], total: 1, page: 1, page_size: 20, pages: 1 })
     probeUpstreamBilling.mockResolvedValue({
       account_id: 7,
       snapshot: {
         status: 'ok',
+        synced_rate_multiplier: 0.065,
         data: { effective_rate_multiplier: 0.065 },
         last_attempt_at: '2026-07-13T00:00:00Z',
         next_probe_at: '2026-07-13T00:30:00Z'
@@ -773,7 +770,7 @@ describe('admin AccountsView bulk edit scope', () => {
     await flushPromises()
 
     expect(probeUpstreamBilling).toHaveBeenCalledWith(7)
-    expect(listAccounts).toHaveBeenCalledTimes(2)
+    expect(listAccounts).toHaveBeenCalledTimes(1)
     expect(wrapper.get('[data-test="account-rate"]').text()).toBe('0.065x')
   })
 })

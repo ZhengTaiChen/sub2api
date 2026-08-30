@@ -143,6 +143,7 @@ const CLOCK_SKEW_TOLERANCE_MS = 5 * 60 * 1000
 const eligible = computed(() => props.account.type === 'apikey')
 const snapshot = computed<UpstreamBillingProbeSnapshot | undefined>(() => props.account.extra?.upstream_billing_probe)
 const data = computed(() => snapshot.value?.data)
+const rateStatus = computed(() => snapshot.value?.rate_status ?? snapshot.value?.status)
 const probeEnabled = computed(() => props.account.extra?.upstream_billing_probe_enabled === true)
 const nextProbeAt = computed(() => {
   const value = snapshot.value?.next_probe_at
@@ -292,22 +293,22 @@ const elapsedSinceLastSuccess = computed(() => {
   return t('admin.accounts.upstreamBilling.daysAgo', { count: Math.floor(elapsedHours / 24) })
 })
 const effectiveRate = computed(() => {
-  if (!validTimestamps.value || stale.value || !['ok', 'failed'].includes(snapshot.value?.status ?? '')) return '-'
+  if (!validTimestamps.value || stale.value || !['ok', 'failed'].includes(rateStatus.value ?? '')) return '-'
   const value = currentEffectiveRate.value
   return value == null ? '-' : `${formatMultiplier(value)}x`
 })
 const statusLabel = computed(() => {
   if (!snapshot.value) return t('admin.accounts.upstreamBilling.notProbed')
-  if (snapshot.value.status === 'unsupported') return t('admin.accounts.upstreamBilling.unsupported')
+  if (rateStatus.value === 'unsupported') return t('admin.accounts.upstreamBilling.unsupported')
   if (stale.value) return t('admin.accounts.upstreamBilling.stale')
-  if (snapshot.value.status === 'failed') return t('admin.accounts.upstreamBilling.failed')
+  if (rateStatus.value === 'failed') return t('admin.accounts.upstreamBilling.failed')
   return ''
 })
 const statusClass = computed(() => {
   if (!snapshot.value) return 'text-gray-400 dark:text-gray-500'
-  if (snapshot.value.status === 'unsupported') return 'text-gray-500 dark:text-gray-400'
+  if (rateStatus.value === 'unsupported') return 'text-gray-500 dark:text-gray-400'
   if (stale.value) return 'text-amber-600 dark:text-amber-400'
-  if (snapshot.value.status === 'failed') return 'text-red-600 dark:text-red-400'
+  if (rateStatus.value === 'failed') return 'text-red-600 dark:text-red-400'
   return ''
 })
 const hasEffectiveRate = computed(() => effectiveRate.value !== '-')
