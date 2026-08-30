@@ -90,6 +90,9 @@ LOG_FILE=$STATE_DIR/deploy.log
 IMAGE_REF=$IMAGE@$DIGEST
 RUNTIME_IMAGE_REF=$IMAGE_REF
 PERSISTED_IMAGE_REF=$IMAGE_REF
+RESOLVED_DIGEST=$DIGEST
+DIGEST_KIND=manifest
+CONTENT_ID=
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 ATTEMPT_ID=$STAMP-$$
 BACKUP_FILE=$STATE_DIR/docker-compose.yml.before-$STAMP
@@ -164,7 +167,10 @@ record_state() {
     printf 'status=%s\n' "$status"
     printf 'updated_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'image=%s\n' "$RUNTIME_IMAGE_REF"
-    printf 'digest=%s\n' "$DIGEST"
+    printf 'digest=%s\n' "$RESOLVED_DIGEST"
+    printf 'requested_digest=%s\n' "$DIGEST"
+    printf 'digest_kind=%s\n' "$DIGEST_KIND"
+    printf 'content_id=%s\n' "$CONTENT_ID"
     printf 'commit=%s\n' "$COMMIT"
     printf 'previous_image=%s\n' "$old_image"
     printf 'prior_successful_image=%s\n' "$old_previous_image"
@@ -406,7 +412,10 @@ retain_release_images() {
 save_release_state() {
   umask 077
   printf '%s\n' "$PERSISTED_IMAGE_REF" > "$STATE_DIR/current-image"
-  printf '%s\n' "$DIGEST" > "$STATE_DIR/current-digest"
+  printf '%s\n' "$RESOLVED_DIGEST" > "$STATE_DIR/current-digest"
+  printf '%s\n' "$DIGEST" > "$STATE_DIR/requested-digest"
+  printf '%s\n' "$CONTENT_ID" > "$STATE_DIR/current-content-id"
+  printf '%s\n' "$DIGEST_KIND" > "$STATE_DIR/digest-kind"
   printf '%s\n' "${old_image:-}" > "$STATE_DIR/previous-image"
   printf '%s\n' "$COMMIT" > "$STATE_DIR/current-commit"
 }
@@ -445,6 +454,20 @@ if [ "$SKIP_PULL" -eq 1 ]; then
 else
   log "pulling $IMAGE_REF"
   docker pull "$IMAGE_REF" >/dev/null || die 'docker pull failed; current service was not changed'
+fi
+
+CONTENT_ID=$(docker image inspect "$RUNTIME_IMAGE_REF" --format '{{.Id}}' 2>/dev/null || true)
+case "$CONTENT_ID" in
+  sha256:????????????????????????????????????????????????????????????????) ;;
+  *) die "could not determine loaded image content ID for $RUNTIME_IMAGE_REF" ;;
+esac
+
+if [ "$SKIP_PULL" -eq 1 ]; then
+  # A local docker save/load may normalize the image config and produce a
+  # daemon-specific content ID. Persist the ID from the target daemon rather
+  # than the ID observed in the build environment.
+  RESOLVED_DIGEST=$CONTENT_ID
+  DIGEST_KIND=content
 fi
 
 arch=$(docker image inspect "$RUNTIME_IMAGE_REF" --format '{{.Architecture}}' 2>/dev/null || true)
@@ -486,4 +509,4 @@ retain_latest_compose_backup
 end_maintenance
 record_state success "container=$container_id docker_health=$health edge_health=$edge_ok"
 notify info deployment_succeeded "image=$PERSISTED_IMAGE_REF commit=$COMMIT"
-log "deployment succeeded: $PERSISTED_IMAGE_REF digest=$DIGEST container=$container_id docker_health=$health edge_health=$edge_ok"
+log "deployment succeeded: $PERSISTED_IMAGE_REF digest=$RESOLVED_DIGEST requested_digest=$DIGEST content_id=$CONTENT_ID container=$container_id docker_health=$health edge_health=$edge_ok"

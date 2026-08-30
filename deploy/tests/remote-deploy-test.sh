@@ -38,7 +38,7 @@ fi
 case "$1" in
   compose) [ "${2:-}" = version ] && { echo 'Docker Compose version v2'; exit 0; }; [ "$mode" = compose-fail ] && exit 1; exit 0 ;;
   pull) [ "$mode" = no-pull ] && exit 1; exit 0 ;;
-  image) if [ "$mode" = no-pull ] && case "$*" in *@sha256:*) true ;; *) false ;; esac; then exit 1; fi; case "$*" in *inspect*) case "$*" in *Architecture*) echo amd64 ;; *revision*) echo commit-test ;; esac ;; esac; exit 0 ;;
+  image) if [ "$mode" = no-pull ] && case "$*" in *@sha256:*) true ;; *) false ;; esac; then exit 1; fi; case "$*" in *inspect*) case "$*" in *Architecture*) echo amd64 ;; *revision*) echo commit-test ;; *'{{.Id}}'*) echo sha256:9999999999999999999999999999999999999999999999999999999999999999 ;; esac ;; esac; exit 0 ;;
   inspect) case "$*" in *Config.Image*) echo old/image:stable ;; *Health.Status*) [ "$mode" = unhealthy ] && echo unhealthy || echo healthy ;; *'{{.Image}}'*) echo old-image-id ;; *'{{.Id}}'*) echo new-container-id ;; esac; exit 0 ;;
   port) echo '0.0.0.0:18080' ;;
   logs) exit 0 ;;
@@ -64,6 +64,8 @@ test ! -e "$tmp_dir/app/.deploy/compose.deploy.yml"
 test ! -e "$maintenance_dir/sub2api"
 grep -Fq 'tag old-image-id sub2api-retain:previous' "$fake_docker_log"
 grep -Fq 'tag example/sub2api:1.0@sha256:0000000000000000000000000000000000000000000000000000000000000000 sub2api-retain:current' "$fake_docker_log"
+grep -Fq 'sha256:0000000000000000000000000000000000000000000000000000000000000000' "$tmp_dir/app/.deploy/current-digest"
+grep -Fq 'sha256:9999999999999999999999999999999999999999999999999999999999999999' "$tmp_dir/app/.deploy/current-content-id"
 cp "$tmp_dir/app/docker-compose.yml" "$tmp_dir/app/docker-compose.yml.success"
 
 if PATH="$fake_bin:$PATH" FAKE_DOCKER_MODE=unhealthy DEPLOY_MAINTENANCE_FILE="$maintenance_dir/sub2api" "$script" --image example/sub2api:2.0 --digest sha256:1111111111111111111111111111111111111111111111111111111111111111 --commit commit-test --deploy-path "$tmp_dir/app" >/dev/null 2>&1; then
@@ -75,7 +77,8 @@ test ! -e "$maintenance_dir/sub2api"
 
 PATH="$fake_bin:$PATH" FAKE_DOCKER_MODE=no-pull "$script" --image example/sub2api:1.0 --digest sha256:0000000000000000000000000000000000000000000000000000000000000000 --commit commit-test --skip-pull --deploy-path "$tmp_dir/app" >/dev/null
 grep -Fq 'image: example/sub2api:1.0' "$tmp_dir/app/docker-compose.yml"
-grep -Fq 'sha256:0000000000000000000000000000000000000000000000000000000000000000' "$tmp_dir/app/.deploy/current-digest"
+grep -Fq 'sha256:9999999999999999999999999999999999999999999999999999999999999999' "$tmp_dir/app/.deploy/current-digest"
+grep -Fq 'sha256:9999999999999999999999999999999999999999999999999999999999999999' "$tmp_dir/app/.deploy/current-content-id"
 cp "$tmp_dir/app/docker-compose.yml.success" "$tmp_dir/app/docker-compose.yml"
 
 if PATH="$fake_bin:$PATH" DEPLOY_MIN_FREE_KIB=999999999 FAKE_DOCKER_LOG="$fake_docker_log" "$script" --image example/sub2api:3.0 --digest sha256:2222222222222222222222222222222222222222222222222222222222222222 --commit commit-test --deploy-path "$tmp_dir/app" >/dev/null 2>&1; then
@@ -111,3 +114,5 @@ test -d "$tmp_dir/app/.deploy/lock"
 test "$(cat "$tmp_dir/app/.deploy/lock/pid")" = "$$"
 
 printf 'remote deploy script test passed\n'
+grep -Fq 'sha256:0000000000000000000000000000000000000000000000000000000000000000' "$tmp_dir/app/.deploy/current-digest"
+grep -Fq 'sha256:9999999999999999999999999999999999999999999999999999999999999999' "$tmp_dir/app/.deploy/current-content-id"

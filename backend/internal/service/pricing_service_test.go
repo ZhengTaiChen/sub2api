@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +12,53 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
 )
+
+type deferredPricingRemoteClient struct {
+	hashCalls chan struct{}
+}
+
+func (c *deferredPricingRemoteClient) FetchPricingJSON(context.Context, string) ([]byte, error) {
+	return nil, errors.New("pricing download disabled in test")
+}
+
+func (c *deferredPricingRemoteClient) FetchHashText(context.Context, string) (string, error) {
+	select {
+	case c.hashCalls <- struct{}{}:
+	default:
+	}
+	return "", errors.New("remote hash unavailable in test")
+}
+
+func TestPricingInitializeDefersRemoteHashCheck(t *testing.T) {
+	dataDir := t.TempDir()
+	pricingFile := filepath.Join(dataDir, "model_pricing.json")
+	require.NoError(t, os.WriteFile(pricingFile, []byte("{\"test-model\":{\"input_cost_per_token\":0.000001,\"output_cost_per_token\":0.000002}}"), 0644))
+
+	client := &deferredPricingRemoteClient{hashCalls: make(chan struct{}, 1)}
+	svc := NewPricingService(&config.Config{Pricing: config.PricingConfig{
+		RemoteURL:                "https://example.invalid/model-pricing.json",
+		HashURL:                  "https://example.invalid/model-pricing.sha256",
+		DataDir:                  dataDir,
+		HashCheckIntervalMinutes: 60,
+	}}, client)
+	defer svc.Stop()
+
+	started := time.Now()
+	require.NoError(t, svc.Initialize())
+	require.Less(t, time.Since(started), 500*time.Millisecond)
+
+	select {
+	case <-client.hashCalls:
+		t.Fatal("remote hash check must be deferred from Initialize")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	select {
+	case <-client.hashCalls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background remote hash check did not run")
+	}
+}
 
 func TestPricingSchedulerBlankRemoteURLDoesNotStart(t *testing.T) {
 	svc := NewPricingService(&config.Config{Pricing: config.PricingConfig{RemoteURL: "  \t  "}}, nil)

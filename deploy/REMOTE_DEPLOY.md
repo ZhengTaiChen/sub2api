@@ -6,8 +6,10 @@ The preferred release path builds an incremental image in the local E-drive WSL
 Docker environment, transfers a gzip archive to a resumable temporary path,
 verifies its SHA-256, then invokes this script with `--skip-pull`. Normal
 production deployment therefore does not need direct GHCR access. Local image
-deployments use a unique image tag plus the Docker image ID as deployment state;
-they do not require a registry manifest digest on the host.
+deployments use a unique image tag. After loading the archive, the target daemon
+resolves its own image content ID and writes it to .deploy/current-digest and
+.deploy/current-content-id. It is intentionally not compared with the build
+daemon's ID because Docker daemons may normalize the image config differently.
 
 ## Server prerequisites
 
@@ -57,9 +59,11 @@ deploy/remote-deploy.sh \
 ```
 
 The local image is still inspected for the requested architecture and OCI
-revision before the container is changed. A `docker load` archive may restore
-only the unique release tag and not a local `RepoDigest`; in that case the
-script uses the tag for the running container and records the requested digest
-under `.deploy/current-digest`.
+revision before the container is changed. A docker load archive may restore
+only the unique release tag and not a registry RepoDigest; in that case the
+script uses the tag for the running container and records the target daemon's
+content ID. The originally supplied value remains available in
+.deploy/requested-digest, with .deploy/digest-kind set to content for archive
+deployments and manifest for registry deployments.
 
 Deployment state and logs are stored under `/opt/sub2api/.deploy`. The newest Compose backup and previous image reference are retained for rollback.

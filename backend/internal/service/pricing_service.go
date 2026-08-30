@@ -176,6 +176,8 @@ type PricingService struct {
 	wg     sync.WaitGroup
 }
 
+const pricingInitialSyncDelay = time.Second
+
 // NewPricingService 创建价格服务
 func NewPricingService(cfg *config.Config, remoteClient PricingRemoteClient) *PricingService {
 	s := &PricingService{
@@ -232,6 +234,20 @@ func (s *PricingService) startUpdateScheduler() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+
+		// 本地价格文件已经在 Initialize 中加载。把第一次远程检查放到
+		// 后台，避免 GitHub/代理网络超时阻塞应用启动。
+		initialTimer := time.NewTimer(pricingInitialSyncDelay)
+		defer initialTimer.Stop()
+		select {
+		case <-initialTimer.C:
+			if err := s.syncWithRemote(); err != nil {
+				logger.LegacyPrintf("service.pricing", "[WARN] [Pricing] Remote pricing sync unavailable; keeping current data: %v", err)
+			}
+		case <-s.stopCh:
+			return
+		}
+
 		ticker := time.NewTicker(hashInterval)
 		defer ticker.Stop()
 
@@ -239,7 +255,7 @@ func (s *PricingService) startUpdateScheduler() {
 			select {
 			case <-ticker.C:
 				if err := s.syncWithRemote(); err != nil {
-					logger.LegacyPrintf("service.pricing", "[Pricing] Sync failed: %v", err)
+					logger.LegacyPrintf("service.pricing", "[WARN] [Pricing] Remote pricing sync unavailable; keeping current data: %v", err)
 				}
 			case <-s.stopCh:
 				return
@@ -266,25 +282,9 @@ func (s *PricingService) checkAndUpdatePricing() error {
 		return s.downloadPricingData()
 	}
 
-	// 如果配置了哈希URL，通过远程哈希检查是否有更新
+	// 如果配置了哈希URL，远程检查放到后台执行，避免外网请求阻塞启动。
 	if s.cfg.Pricing.HashURL != "" {
-		remoteHash, err := s.fetchRemoteHash()
-		if err != nil {
-			logger.LegacyPrintf("service.pricing", "[Pricing] Failed to fetch remote hash on startup: %v", err)
-			return nil // 已加载本地文件，哈希获取失败不影响启动
-		}
-
-		s.mu.RLock()
-		localHash := s.localHash
-		s.mu.RUnlock()
-
-		if localHash == "" || remoteHash != localHash {
-			logger.LegacyPrintf("service.pricing", "[Pricing] Remote hash differs on startup (local=%s remote=%s), downloading...",
-				localHash[:min(8, len(localHash))], remoteHash[:min(8, len(remoteHash))])
-			if err := s.downloadPricingData(); err != nil {
-				logger.LegacyPrintf("service.pricing", "[Pricing] Download failed, using existing file: %v", err)
-			}
-		}
+		logger.LegacyPrintf("service.pricing", "%s", "[Pricing] Remote hash check deferred to background scheduler")
 		return nil
 	}
 
@@ -300,7 +300,7 @@ func (s *PricingService) checkAndUpdatePricing() error {
 	if fileAge > maxAge {
 		logger.LegacyPrintf("service.pricing", "[Pricing] Local file is %v old, updating...", fileAge.Round(time.Hour))
 		if err := s.downloadPricingData(); err != nil {
-			logger.LegacyPrintf("service.pricing", "[Pricing] Download failed, using existing file: %v", err)
+			logger.LegacyPrintf("service.pricing", "[WARN] [Pricing] Pricing download unavailable; using existing file: %v", err)
 		}
 	}
 
@@ -313,7 +313,7 @@ func (s *PricingService) syncWithRemote() error {
 	if s.cfg.Pricing.HashURL != "" {
 		remoteHash, err := s.fetchRemoteHash()
 		if err != nil {
-			logger.LegacyPrintf("service.pricing", "[Pricing] Failed to fetch remote hash: %v", err)
+			logger.LegacyPrintf("service.pricing", "[WARN] [Pricing] Remote hash unavailable; keeping current pricing: %v", err)
 			return nil // 哈希获取失败不影响正常使用
 		}
 
@@ -364,7 +364,7 @@ func (s *PricingService) downloadPricingData() error {
 	if strings.TrimSpace(s.cfg.Pricing.HashURL) != "" {
 		remoteHash, err = s.fetchRemoteHash()
 		if err != nil {
-			logger.LegacyPrintf("service.pricing", "[Pricing] Failed to fetch remote hash (continuing): %v", err)
+			logger.LegacyPrintf("service.pricing", "[WARN] [Pricing] Remote hash unavailable while downloading; continuing without it: %v", err)
 		}
 	}
 
