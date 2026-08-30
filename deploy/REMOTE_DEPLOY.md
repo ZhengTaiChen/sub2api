@@ -2,9 +2,12 @@
 
 `remote-deploy.sh` is the production deployment entrypoint used by GitHub Actions. It never builds source code on the target host.
 
-The preferred local release path downloads the amd64 image archive produced by
-the release workflow, transfers it to the host, and invokes this script with
-`--skip-pull`. The host therefore does not need direct GHCR access.
+The preferred release path builds an incremental image in the local E-drive WSL
+Docker environment, transfers a gzip archive to a resumable temporary path,
+verifies its SHA-256, then invokes this script with `--skip-pull`. Normal
+production deployment therefore does not need direct GHCR access. Local image
+deployments use a unique image tag plus the Docker image ID as deployment state;
+they do not require a registry manifest digest on the host.
 
 ## Server prerequisites
 

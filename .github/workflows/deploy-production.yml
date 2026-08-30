@@ -15,14 +15,6 @@ on:
         description: 'Expected org.opencontainers.image.revision label'
         required: false
         type: string
-      version:
-        description: 'Release version whose amd64 image artifact should be deployed, for example 0.1.183-9660f26ed'
-        required: false
-        type: string
-      release_run_id:
-        description: 'Release workflow run ID that owns the image artifact'
-        required: false
-        type: string
       deploy_path:
         description: 'Production Compose directory'
         required: false
@@ -35,7 +27,6 @@ concurrency:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
   deploy:
@@ -48,14 +39,6 @@ jobs:
         with:
           sparse-checkout: deploy/remote-deploy.sh
           sparse-checkout-cone-mode: false
-
-      - name: Download amd64 deployment image
-        if: ${{ inputs.version != '' && inputs.release_run_id != '' }}
-        uses: actions/download-artifact@v8
-        with:
-          run-id: ${{ inputs.release_run_id }}
-          name: sub2api-image-${{ inputs.version }}
-          path: .deploy
 
       - name: Configure SSH
         uses: webfactory/ssh-agent@v0.9.1
@@ -70,7 +53,6 @@ jobs:
           DIGEST: ${{ inputs.digest }}
           COMMIT: ${{ inputs.commit }}
           DEPLOY_PATH: ${{ inputs.deploy_path }}
-          ARCHIVE: .deploy/sub2api-image.tar
         shell: bash
         run: |
           set -euo pipefail
@@ -78,35 +60,14 @@ jobs:
           test -n "${DEPLOY_USER}"
           ssh-keyscan -H "${DEPLOY_HOST}" >> "${HOME}/.ssh/known_hosts" 2>/dev/null
           remote_script="/tmp/sub2api-remote-deploy-${GITHUB_RUN_ID}.sh"
-          remote_archive="/tmp/sub2api-image-${GITHUB_RUN_ID}.tar"
           ssh_opts=(-o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o TCPKeepAlive=yes)
           scp "${ssh_opts[@]}" deploy/remote-deploy.sh "${DEPLOY_USER}@${DEPLOY_HOST}:${remote_script}"
-          if [ -n "${{ inputs.version }}" ] && [ -n "${{ inputs.release_run_id }}" ]; then
-            test -s "${ARCHIVE}"
-            scp "${ssh_opts[@]}" "${ARCHIVE}" "${DEPLOY_USER}@${DEPLOY_HOST}:${remote_archive}"
-          fi
           ssh "${ssh_opts[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" chmod 700 "${remote_script}"
-          if [ -n "${{ inputs.version }}" ] && [ -n "${{ inputs.release_run_id }}" ]; then
-            ssh "${ssh_opts[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" bash -s -- "${remote_script}" "${remote_archive}" "${IMAGE}" "${DIGEST}" "${COMMIT}" "${DEPLOY_PATH}" <<'REMOTE'
-            set -euo pipefail
-            remote_script="$1"
-            remote_archive="$2"
-            image="$3"
-            digest="$4"
-            commit="$5"
-            deploy_path="$6"
-            cleanup() { rm -f "$remote_script" "$remote_archive"; }
-            trap cleanup EXIT
-            docker load -i "$remote_archive"
-            bash "$remote_script" --image "$image" --digest "$digest" --commit "$commit" --skip-pull --deploy-path "$deploy_path"
-          REMOTE
-          else
-            ssh "${ssh_opts[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" bash "${remote_script}" \
-              --image "${IMAGE}" \
-              --digest "${DIGEST}" \
-              --commit "${COMMIT}" \
-              --deploy-path "${DEPLOY_PATH}"
-          fi
+          ssh "${ssh_opts[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" bash "${remote_script}" \
+            --image "${IMAGE}" \
+            --digest "${DIGEST}" \
+            --commit "${COMMIT}" \
+            --deploy-path "${DEPLOY_PATH}"
           ssh "${ssh_opts[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" rm -f "${remote_script}"
 
       - name: Write deployment summary
