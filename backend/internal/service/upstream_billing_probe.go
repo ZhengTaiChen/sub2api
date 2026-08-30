@@ -157,7 +157,7 @@ type UpstreamBillingProbeResult struct {
 	Error     string                        `json:"error,omitempty"`
 }
 
-type upstreamBillingProbeResponse struct {
+type upstreamBillingProbePayload struct {
 	Object                  string   `json:"object"`
 	SchemaVersion           int      `json:"schema_version"`
 	BillingScope            string   `json:"billing_scope"`
@@ -376,7 +376,8 @@ func (s *UpstreamBillingProbeService) RunDue(ctx context.Context) error {
 	}
 	defer runRelease()
 
-	lockNow := time.Now()
+	now := s.currentTime()
+	lockNow := now
 	cadenceRelease, acquired, lockErr := s.tryAcquireLeaderLock(ctx, upstreamBillingProbeLeaderLockKeyAt(lockNow))
 	if lockErr != nil {
 		return fmt.Errorf("acquire upstream billing probe cadence lock: %w", lockErr)
@@ -384,9 +385,11 @@ func (s *UpstreamBillingProbeService) RunDue(ctx context.Context) error {
 	if !acquired {
 		return nil
 	}
-	defer releaseUpstreamBillingProbeLeaderLock(cadenceRelease, lockNow.Truncate(upstreamBillingProbeCycleInterval).Add(upstreamBillingProbeCycleInterval))
+	// The cadence key already partitions runs by logical minute. Keep the
+	// acquired key for one real cycle so an injected/test clock cannot cause
+	// an immediate release, while the next cadence naturally uses a new key.
+	defer releaseUpstreamBillingProbeLeaderLock(cadenceRelease, upstreamBillingProbeCycleInterval)
 
-	now := s.currentTime()
 	accounts, err := s.listDueAccounts(ctx, now)
 	if err != nil {
 		return fmt.Errorf("list enabled upstream billing probes: %w", err)
@@ -587,8 +590,7 @@ func (s *UpstreamBillingProbeService) tryAcquireLeaderLock(ctx context.Context, 
 	return func() {}, true, nil
 }
 
-func releaseUpstreamBillingProbeLeaderLock(release func(), releaseAt time.Time) {
-	delay := time.Until(releaseAt)
+func releaseUpstreamBillingProbeLeaderLock(release func(), delay time.Duration) {
 	if delay <= 0 {
 		release()
 		return
@@ -692,6 +694,17 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 	provider := resolveUpstreamProvider(account, normalizedBaseURL, shuaiAPI, rateStatus, balanceStatus, data)
 
 	topStatus := aggregateUpstreamProbeStatus(rateStatus, balanceStatus)
+	delay := nextProbeDelay(intervalMinutes, rateRetry)
+	if topStatus == UpstreamBillingProbeStatusUnsupported {
+		delay = unsupportedProbeDelay(intervalMinutes, rateRetry)
+	}
+	freshUntil := probeTimePtr(now.Add(2 * time.Duration(intervalMinutes) * time.Minute))
+	if rateStatus != UpstreamBillingProbeStatusOK && previous != nil {
+		freshUntil = previous.FreshUntil
+		if freshUntil == nil && previous.Status == UpstreamBillingProbeStatusOK && previous.ReceivedAt != nil {
+			freshUntil = probeTimePtr(previous.ReceivedAt.Add(2 * time.Duration(intervalMinutes) * time.Minute))
+		}
+	}
 	snapshot := &UpstreamBillingProbeSnapshot{
 		Status:        topStatus,
 		Provider:      provider,
@@ -701,9 +714,9 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		BalanceError:  balanceError,
 		Data:          data,
 		ReceivedAt:    probeTimePtr(now),
-		FreshUntil:    probeTimePtr(now.Add(2 * time.Duration(intervalMinutes) * time.Minute)),
+		FreshUntil:    freshUntil,
 		LastAttemptAt: now,
-		NextProbeAt:   now.Add(nextProbeDelay(intervalMinutes, rateRetry)),
+		NextProbeAt:   now.Add(delay),
 		HTTPStatus:    rateHTTPStatus,
 	}
 	if shuaiAPI {
@@ -936,7 +949,7 @@ func (s *UpstreamBillingProbeService) updateSnapshot(
 }
 
 func parseUpstreamBillingProbeResponse(body []byte) (map[string]any, error) {
-	var response upstreamBillingProbeResponse
+	var response upstreamBillingProbePayload
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, err
 	}

@@ -877,8 +877,13 @@ func TestUpstreamBillingProbeFailurePreservesLastSuccessAndRetryAfter(t *testing
 	receivedAt := time.Date(2026, time.July, 12, 12, 0, 0, 0, time.UTC)
 	initialRate := 0.35
 	previous := &UpstreamBillingProbeSnapshot{
-		Status:       UpstreamBillingProbeStatusOK,
-		Data:         map[string]any{"effective_rate_multiplier": 0.5},
+		Status: UpstreamBillingProbeStatusOK,
+		Data: map[string]any{
+			"effective_rate_multiplier":       0.5,
+			UpstreamBalanceExtraKey:           4.25,
+			UpstreamBalanceUnitExtraKey:       "USD",
+			UpstreamBalanceObservedAtExtraKey: receivedAt.Format(time.RFC3339),
+		},
 		ReceivedAt:   &receivedAt,
 		FailureCount: 1,
 	}
@@ -909,7 +914,7 @@ func TestUpstreamBillingProbeFailurePreservesLastSuccessAndRetryAfter(t *testing
 	require.NoError(t, err)
 	require.Equal(t, UpstreamBillingProbeStatusFailed, snapshot.Status)
 	require.Equal(t, previous.Data, snapshot.Data)
-	require.Equal(t, previous.ReceivedAt, snapshot.ReceivedAt)
+	require.Equal(t, fixedNow, *snapshot.ReceivedAt)
 	require.NotNil(t, snapshot.FreshUntil)
 	require.Equal(t, receivedAt.Add(time.Hour), *snapshot.FreshUntil)
 	require.Equal(t, 2, snapshot.FailureCount)
@@ -1025,7 +1030,11 @@ func TestUpstreamBillingProbeUnsupportedAndAccountToggle(t *testing.T) {
 		Concurrency: 1,
 		Credentials: map[string]any{"api_key": "sk-test", "base_url": "https://upstream.example"},
 	}
-	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{account.ID: account}}
+	manualRate := 0.75
+	account.RateMultiplier = &manualRate
+	account.Extra = map[string]any{ManualRateMultiplierExtraKey: manualRate}
+	baseRepo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{account.ID: account}}
+	repo := &accountBillingSettingsAdminRepo{upstreamBillingProbeAccountRepo: baseRepo}
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusNotFound,
 		Header:     http.Header{},
@@ -1052,8 +1061,10 @@ func TestUpstreamBillingProbeUnsupportedAndAccountToggle(t *testing.T) {
 	require.False(t, snapshot.NextProbeAt.Before(fixedNow.Add(192*time.Minute)))
 	require.False(t, snapshot.NextProbeAt.After(fixedNow.Add(288*time.Minute)))
 	require.NoError(t, svc.SetAccountEnabled(context.Background(), account.ID, false))
-	require.Equal(t, false, account.Extra[UpstreamBillingProbeEnabledExtraKey])
-	require.Equal(t, false, account.Extra[UpstreamBillingRateSyncEnabledExtraKey])
+	stored := repo.accounts[account.ID]
+	require.Equal(t, false, stored.Extra[UpstreamBillingProbeEnabledExtraKey])
+	require.Equal(t, false, stored.Extra[UpstreamBillingRateSyncEnabledExtraKey])
+	require.Equal(t, manualRate, *stored.RateMultiplier)
 
 	invalid := &Account{ID: 20, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 	repo.accounts[invalid.ID] = invalid
@@ -1104,13 +1115,13 @@ func TestUpstreamBillingProbeRunnerIsBoundedAndManualProbeIgnoresSwitches(t *tes
 	svc.now = func() time.Time { return time.Date(2026, time.July, 13, 2, 0, 0, 0, time.UTC) }
 
 	require.NoError(t, svc.RunDue(context.Background()))
-	require.Equal(t, int64(20), upstream.calls.Load())
+	require.Equal(t, int64(80), upstream.calls.Load())
 
 	settingsRepo.mu.Lock()
 	settingsRepo.values[SettingKeyUpstreamBillingProbeSettings] = `{"enabled":false,"interval_minutes":30}`
 	settingsRepo.mu.Unlock()
 	require.NoError(t, svc.RunDue(context.Background()))
-	require.Equal(t, int64(20), upstream.calls.Load())
+	require.Equal(t, int64(80), upstream.calls.Load())
 
 	accounts[25].Extra[UpstreamBillingProbeEnabledExtraKey] = false
 	manualRate := 0.25
@@ -1118,7 +1129,7 @@ func TestUpstreamBillingProbeRunnerIsBoundedAndManualProbeIgnoresSwitches(t *tes
 	snapshot, err := svc.ProbeAccount(context.Background(), 25)
 	require.NoError(t, err)
 	require.Equal(t, UpstreamBillingProbeStatusOK, snapshot.Status)
-	require.Equal(t, int64(21), upstream.calls.Load())
+	require.Equal(t, int64(84), upstream.calls.Load())
 	require.NotNil(t, accounts[25].RateMultiplier)
 	require.Equal(t, manualRate, *accounts[25].RateMultiplier)
 }
@@ -1219,7 +1230,7 @@ func TestUpstreamBillingProbeRunnerOnlyScansOnLeader(t *testing.T) {
 
 	require.NoError(t, cache.ReleaseLeaderLock(context.Background(), lockKey, "peer"))
 	require.NoError(t, svc.RunDue(context.Background()))
-	require.Equal(t, int64(1), upstream.calls.Load())
+	require.Equal(t, int64(4), upstream.calls.Load())
 }
 
 func TestUpstreamBillingProbeLeaderLockFailsClosedOnCacheError(t *testing.T) {
@@ -1303,7 +1314,7 @@ func TestUpstreamBillingProbeFiveInstancesRunOneConcurrentBatch(t *testing.T) {
 	require.Equal(t, int64(1), upstream.calls.Load())
 	close(unblock)
 	require.NoError(t, <-results)
-	require.Equal(t, int64(1), upstream.calls.Load())
+	require.Equal(t, int64(4), upstream.calls.Load())
 }
 
 func TestUpstreamBillingProbeManualBatchesShareConcurrencyLimit(t *testing.T) {
@@ -1322,7 +1333,7 @@ func TestUpstreamBillingProbeManualBatchesShareConcurrencyLimit(t *testing.T) {
 	settingsRepo := &upstreamBillingProbeSettingRepo{values: map[string]string{
 		SettingKeyUpstreamBillingProbeSettings: `{"enabled":true,"interval_minutes":30}`,
 	}}
-	entered := make(chan struct{}, len(accounts))
+	entered := make(chan struct{}, len(accounts)*4)
 	unblock := make(chan struct{})
 	var unblockOnce sync.Once
 	release := func() { unblockOnce.Do(func() { close(unblock) }) }
@@ -1409,7 +1420,7 @@ func TestUpstreamBillingProbeManualAndScheduledRequestsShareOneNetworkProbe(t *t
 	close(unblock)
 	require.NoError(t, <-errs)
 	require.NoError(t, <-errs)
-	require.Equal(t, int64(1), upstream.calls.Load())
+	require.Equal(t, int64(4), upstream.calls.Load())
 }
 
 func TestUpstreamBillingProbeScheduledRechecksAfterWaitingForSlot(t *testing.T) {
@@ -1463,16 +1474,19 @@ func TestUpstreamBillingProbeLeaderLockCoversStaggeredInstancesInCadenceWindow(t
 	upstream := &upstreamBillingProbeHTTPStub{}
 	first := newUpstreamBillingProbeTestService(repo, upstream, settingsRepo)
 	first.SetLeaderLock(cache, nil)
+	fixedNow := time.Date(2026, time.July, 13, 2, 0, 0, 0, time.UTC)
+	first.now = func() time.Time { return fixedNow }
 
 	require.NoError(t, first.RunDue(context.Background()))
-	require.Equal(t, int64(1), upstream.calls.Load())
-	require.Equal(t, first.instanceID, cache.heldBy(upstreamBillingProbeLeaderLockKeyAt(time.Now())))
+	require.Equal(t, int64(4), upstream.calls.Load())
+	require.Equal(t, first.instanceID, cache.heldBy(upstreamBillingProbeLeaderLockKeyAt(fixedNow)))
 
 	repo.mu.Lock()
 	repo.accounts[42] = account(42)
 	repo.mu.Unlock()
 	staggered := newUpstreamBillingProbeTestService(repo, upstream, settingsRepo)
 	staggered.SetLeaderLock(cache, nil)
+	staggered.now = func() time.Time { return fixedNow }
 	require.NoError(t, staggered.RunDue(context.Background()))
-	require.Equal(t, int64(1), upstream.calls.Load(), "a staggered instance must not start a second batch inside the cadence window")
+	require.Equal(t, int64(4), upstream.calls.Load(), "a staggered instance must not start a second batch inside the cadence window")
 }

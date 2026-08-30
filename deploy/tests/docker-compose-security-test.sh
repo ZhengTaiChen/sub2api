@@ -41,4 +41,9 @@ do
   check_application_security_opt "$compose_file"
 done
 
+for compose_file in deploy/docker-compose.yml deploy/docker-compose.local.yml; do
+  grep -Fq 'SERVER_TRUSTED_PROXIES=${SERVER_TRUSTED_PROXIES:-}' "$compose_file"
+  grep -Fq 'SECURITY_TRUST_FORWARDED_IP_FOR_API_KEY_ACL=${SECURITY_TRUST_FORWARDED_IP_FOR_API_KEY_ACL:-false}' "$compose_file"
+done
+
 printf 'docker compose security test passed\n'

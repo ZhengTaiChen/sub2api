@@ -14,6 +14,9 @@ grep -Fq 'docker compose -f "$COMPOSE_FILE" up -d --no-deps sub2api' "$script"
 grep -Fq 'rollback()' "$script"
 grep -Fq 'org.opencontainers.image.revision' "$script"
 grep -Fq 'docker-compose.yml.before-' "$script"
+grep -Fq 'DEPLOY_MIN_FREE_KIB' "$script"
+grep -Fq 'begin_maintenance' "$script"
+grep -Fq 'wait_for_edge_health' "$script"
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT INT TERM
@@ -29,6 +32,9 @@ EOF
 cat > "$fake_bin/docker" <<'EOF'
 #!/bin/sh
 mode=${FAKE_DOCKER_MODE:-success}
+if [ -n "${FAKE_DOCKER_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+fi
 case "$1" in
   compose) [ "${2:-}" = version ] && { echo 'Docker Compose version v2'; exit 0; }; [ "$mode" = compose-fail ] && exit 1; exit 0 ;;
   pull) [ "$mode" = no-pull ] && exit 1; exit 0 ;;
@@ -41,23 +47,67 @@ esac
 EOF
 cat > "$fake_bin/curl" <<'EOF'
 #!/bin/sh
+case "$*" in
+  *edge-health*) [ "${FAKE_CURL_MODE:-}" != edge-fail ] || exit 1 ;;
+esac
 [ "${FAKE_DOCKER_MODE:-success}" != unhealthy ]
 EOF
 chmod +x "$fake_bin/docker" "$fake_bin/curl"
 
-PATH="$fake_bin:$PATH" FAKE_DOCKER_MODE=success "$script" --image example/sub2api:1.0 --digest sha256:0000000000000000000000000000000000000000000000000000000000000000 --commit commit-test --deploy-path "$tmp_dir/app" >/dev/null
+maintenance_dir=$tmp_dir/maintenance
+mkdir -p "$maintenance_dir"
+fake_docker_log=$tmp_dir/docker.log
+
+PATH="$fake_bin:$PATH" FAKE_DOCKER_MODE=success FAKE_DOCKER_LOG="$fake_docker_log" DEPLOY_MAINTENANCE_FILE="$maintenance_dir/sub2api" "$script" --image example/sub2api:1.0 --digest sha256:0000000000000000000000000000000000000000000000000000000000000000 --commit commit-test --deploy-path "$tmp_dir/app" >/dev/null
 grep -Fq 'example/sub2api:1.0@sha256:' "$tmp_dir/app/docker-compose.yml"
 test ! -e "$tmp_dir/app/.deploy/compose.deploy.yml"
+test ! -e "$maintenance_dir/sub2api"
+grep -Fq 'tag old-image-id sub2api-retain:previous' "$fake_docker_log"
+grep -Fq 'tag example/sub2api:1.0@sha256:0000000000000000000000000000000000000000000000000000000000000000 sub2api-retain:current' "$fake_docker_log"
 cp "$tmp_dir/app/docker-compose.yml" "$tmp_dir/app/docker-compose.yml.success"
 
-if PATH="$fake_bin:$PATH" FAKE_DOCKER_MODE=unhealthy "$script" --image example/sub2api:2.0 --digest sha256:1111111111111111111111111111111111111111111111111111111111111111 --commit commit-test --deploy-path "$tmp_dir/app" >/dev/null 2>&1; then
+if PATH="$fake_bin:$PATH" FAKE_DOCKER_MODE=unhealthy DEPLOY_MAINTENANCE_FILE="$maintenance_dir/sub2api" "$script" --image example/sub2api:2.0 --digest sha256:1111111111111111111111111111111111111111111111111111111111111111 --commit commit-test --deploy-path "$tmp_dir/app" >/dev/null 2>&1; then
   printf 'remote deploy script did not roll back unhealthy image\n' >&2
   exit 1
 fi
 cmp "$tmp_dir/app/docker-compose.yml" "$tmp_dir/app/docker-compose.yml.success"
+test ! -e "$maintenance_dir/sub2api"
 
 PATH="$fake_bin:$PATH" FAKE_DOCKER_MODE=no-pull "$script" --image example/sub2api:1.0 --digest sha256:0000000000000000000000000000000000000000000000000000000000000000 --commit commit-test --skip-pull --deploy-path "$tmp_dir/app" >/dev/null
 grep -Fq 'image: example/sub2api:1.0' "$tmp_dir/app/docker-compose.yml"
 grep -Fq 'sha256:0000000000000000000000000000000000000000000000000000000000000000' "$tmp_dir/app/.deploy/current-digest"
+cp "$tmp_dir/app/docker-compose.yml.success" "$tmp_dir/app/docker-compose.yml"
+
+if PATH="$fake_bin:$PATH" DEPLOY_MIN_FREE_KIB=999999999 FAKE_DOCKER_LOG="$fake_docker_log" "$script" --image example/sub2api:3.0 --digest sha256:2222222222222222222222222222222222222222222222222222222222222222 --commit commit-test --deploy-path "$tmp_dir/app" >/dev/null 2>&1; then
+  printf 'remote deploy script did not block deployment on low disk\n' >&2
+  exit 1
+fi
+if grep -Fq 'pull example/sub2api:3.0@sha256:2222222222222222222222222222222222222222222222222222222222222222' "$fake_docker_log"; then
+  printf 'remote deploy script pulled an image after low disk rejection\n' >&2
+  exit 1
+fi
+
+if PATH="$fake_bin:$PATH" FAKE_CURL_MODE=edge-fail DEPLOY_EDGE_HEALTH_URL=http://edge-health DEPLOY_EDGE_HEALTH_TIMEOUT=1 DEPLOY_MAINTENANCE_FILE="$maintenance_dir/sub2api" "$script" --image example/sub2api:4.0 --digest sha256:3333333333333333333333333333333333333333333333333333333333333333 --commit commit-test --deploy-path "$tmp_dir/app" >/dev/null 2>&1; then
+  printf 'remote deploy script did not roll back an edge health failure\n' >&2
+  exit 1
+fi
+cmp "$tmp_dir/app/docker-compose.yml" "$tmp_dir/app/docker-compose.yml.success"
+test ! -e "$maintenance_dir/sub2api"
+
+mkdir -p "$tmp_dir/app/.deploy/lock"
+printf '%s\n' 999999 > "$tmp_dir/app/.deploy/lock/pid"
+printf '%s\n' 0 > "$tmp_dir/app/.deploy/lock/started-at"
+PATH="$fake_bin:$PATH" DEPLOY_LOCK_STALE_SECONDS=1 DEPLOY_MAINTENANCE_FILE="$maintenance_dir/sub2api" "$script" --image example/sub2api:5.0 --digest sha256:4444444444444444444444444444444444444444444444444444444444444444 --commit commit-test --deploy-path "$tmp_dir/app" >/dev/null
+test ! -d "$tmp_dir/app/.deploy/lock"
+
+mkdir -p "$tmp_dir/app/.deploy/lock"
+printf '%s\n' "$$" > "$tmp_dir/app/.deploy/lock/pid"
+date -u +%s > "$tmp_dir/app/.deploy/lock/started-at"
+if PATH="$fake_bin:$PATH" DEPLOY_MAINTENANCE_FILE="$maintenance_dir/sub2api" "$script" --image example/sub2api:6.0 --digest sha256:5555555555555555555555555555555555555555555555555555555555555555 --commit commit-test --deploy-path "$tmp_dir/app" > /dev/null 2>&1; then
+  printf 'remote deploy script accepted a live deployment lock\n' >&2
+  exit 1
+fi
+test -d "$tmp_dir/app/.deploy/lock"
+test "$(cat "$tmp_dir/app/.deploy/lock/pid")" = "$$"
 
 printf 'remote deploy script test passed\n'

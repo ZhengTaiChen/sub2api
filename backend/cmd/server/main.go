@@ -37,6 +37,8 @@ var (
 	BuildType = "source" // "source" for manual builds, "release" for CI builds (set by ldflags)
 )
 
+const gracefulShutdownTimeout = 45 * time.Second
+
 func init() {
 	// 如果 Version 已通过 ldflags 注入（例如 -X main.Version=...），则不要覆盖。
 	if strings.TrimSpace(Version) != "" {
@@ -184,7 +186,9 @@ func runMainServer() {
 
 	log.Println("Shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Keep established streaming responses alive during a rolling container
+	// replacement. Docker grants a slightly larger stop grace period.
+	ctx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
 	defer cancel()
 
 	if err := app.Server.Shutdown(ctx); err != nil {

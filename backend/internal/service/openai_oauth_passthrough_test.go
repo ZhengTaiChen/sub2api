@@ -34,11 +34,12 @@ type httpUpstreamRecorder struct {
 	requests     []*http.Request
 	bodies       [][]byte
 
-	resp      *http.Response
-	responses []*http.Response
-	err       error
-	respUsed  bool
-	respCache *httpUpstreamResponseCache
+	resp       *http.Response
+	responses  []*http.Response
+	err        error
+	respUsed   bool
+	respCache  *httpUpstreamResponseCache
+	respSource *http.Response
 }
 
 type httpUpstreamResponseCache struct {
@@ -115,6 +116,14 @@ func (u *httpUpstreamRecorder) Do(req *http.Request, proxyURL string, accountID 
 	if u.err != nil {
 		u.mu.Unlock()
 		return nil, u.err
+	}
+	// Tests sometimes replace resp between sequential requests. Reset the
+	// replay cache for the new response while preserving the existing
+	// behavior of replaying one response body across retries.
+	if u.resp != nil && u.resp != u.respSource {
+		u.respSource = u.resp
+		u.respUsed = false
+		u.respCache = nil
 	}
 	if len(u.responses) > 0 {
 		resp := u.responses[0]

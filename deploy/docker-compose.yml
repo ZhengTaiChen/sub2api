@@ -19,6 +19,7 @@ services:
     image: weishaw/sub2api:latest
     container_name: sub2api
     restart: unless-stopped
+    stop_grace_period: ${SUB2API_STOP_GRACE_PERIOD:-60s}
     security_opt:
       - no-new-privileges:true
     ulimits:
@@ -49,6 +50,12 @@ services:
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8080
       - SERVER_MODE=${SERVER_MODE:-release}
+      # Comma-separated CIDRs/IPs for the reverse proxies allowed to supply
+      # client-IP forwarding headers. Keep this empty for direct deployments.
+      - SERVER_TRUSTED_PROXIES=${SERVER_TRUSTED_PROXIES:-}
+      # Disable raw forwarded-header compatibility. Trusted proxies above then
+      # become authoritative for API-key ACL and other security-sensitive IP use.
+      - SECURITY_TRUST_FORWARDED_IP_FOR_API_KEY_ACL=${SECURITY_TRUST_FORWARDED_IP_FOR_API_KEY_ACL:-false}
       - ENABLE_SERVER_TIMING=${ENABLE_SERVER_TIMING:-false}
       - RUN_MODE=${RUN_MODE:-standard}
       - UPDATE_GITHUB_TOKEN=${UPDATE_GITHUB_TOKEN:-}

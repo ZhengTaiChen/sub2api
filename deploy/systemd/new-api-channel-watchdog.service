@@ -1,0 +1,13 @@
+[Unit]
+Description=new-api channel isolation watchdog
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/new-api-channel-watchdog
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

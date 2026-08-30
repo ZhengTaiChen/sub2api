@@ -1,0 +1,13 @@
+[Unit]
+Description=Sub2API conservative Docker and disk housekeeping
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/sub2api-housekeeping
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

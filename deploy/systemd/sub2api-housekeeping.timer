@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Sub2API housekeeping daily
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=sub2api-housekeeping.service
+
+[Install]
+WantedBy=timers.target
