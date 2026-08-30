@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Sub2API active health monitor every minute
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=1m
+Persistent=true
+RandomizedDelaySec=10s
+Unit=sub2api-service-health.service
+
+[Install]
+WantedBy=timers.target

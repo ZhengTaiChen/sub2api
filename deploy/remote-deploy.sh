@@ -103,6 +103,9 @@ LOCK_ACQUIRED=0
 old_image=
 old_id=
 old_previous_image=
+old_digest=
+old_content_id=
+old_commit=
 health=unknown
 http_ok=0
 edge_ok=0
@@ -155,10 +158,18 @@ run_housekeeping() {
   return 1
 }
 
+read_state_value() {
+  state_file=$1
+  [ -r "$state_file" ] || return 0
+  sed -n '1{s/\r$//;p;}' "$state_file"
+}
+
 record_state() {
   status=$1
   detail=$2
   safe_detail=$(printf '%s' "$detail" | tr '\n' ' ')
+  rollback_backup=
+  [ -f "$BACKUP_FILE" ] && rollback_backup=$BACKUP_FILE
   tmp_file=$STATE_DIR/last-deployment.env.tmp
   mkdir -p "$STATE_DIR"
   umask 077
@@ -173,6 +184,10 @@ record_state() {
     printf 'content_id=%s\n' "$CONTENT_ID"
     printf 'commit=%s\n' "$COMMIT"
     printf 'previous_image=%s\n' "$old_image"
+    printf 'previous_digest=%s\n' "$old_digest"
+    printf 'previous_content_id=%s\n' "$old_content_id"
+    printf 'previous_commit=%s\n' "$old_commit"
+    printf 'rollback_compose_backup=%s\n' "$rollback_backup"
     printf 'prior_successful_image=%s\n' "$old_previous_image"
     printf 'detail=%s\n' "$safe_detail"
   } > "$tmp_file"
@@ -417,6 +432,10 @@ save_release_state() {
   printf '%s\n' "$CONTENT_ID" > "$STATE_DIR/current-content-id"
   printf '%s\n' "$DIGEST_KIND" > "$STATE_DIR/digest-kind"
   printf '%s\n' "${old_image:-}" > "$STATE_DIR/previous-image"
+  printf '%s\n' "${old_digest:-}" > "$STATE_DIR/previous-digest"
+  printf '%s\n' "${old_content_id:-}" > "$STATE_DIR/previous-content-id"
+  printf '%s\n' "${old_commit:-}" > "$STATE_DIR/previous-commit"
+  printf '%s\n' "$BACKUP_FILE" > "$STATE_DIR/rollback-compose-backup"
   printf '%s\n' "$COMMIT" > "$STATE_DIR/current-commit"
 }
 
@@ -437,7 +456,11 @@ check_free_space
 
 old_image=$(docker inspect sub2api --format '{{.Config.Image}}' 2>/dev/null || true)
 old_id=$(docker inspect sub2api --format '{{.Image}}' 2>/dev/null || true)
-[ -r "$STATE_DIR/previous-image" ] && old_previous_image=$(cat "$STATE_DIR/previous-image" 2>/dev/null || true)
+old_previous_image=$(read_state_value "$STATE_DIR/previous-image")
+old_digest=$(read_state_value "$STATE_DIR/current-digest")
+old_content_id=$(read_state_value "$STATE_DIR/current-content-id")
+old_commit=$(read_state_value "$STATE_DIR/current-commit")
+[ -n "$old_content_id" ] || old_content_id=$old_id
 
 if [ "$SKIP_PULL" -eq 1 ]; then
   if docker image inspect "$IMAGE_REF" >/dev/null 2>&1; then

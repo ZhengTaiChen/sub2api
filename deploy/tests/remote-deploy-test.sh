@@ -79,6 +79,10 @@ PATH="$fake_bin:$PATH" FAKE_DOCKER_MODE=no-pull "$script" --image example/sub2ap
 grep -Fq 'image: example/sub2api:1.0' "$tmp_dir/app/docker-compose.yml"
 grep -Fq 'sha256:9999999999999999999999999999999999999999999999999999999999999999' "$tmp_dir/app/.deploy/current-digest"
 grep -Fq 'sha256:9999999999999999999999999999999999999999999999999999999999999999' "$tmp_dir/app/.deploy/current-content-id"
+grep -Fq 'sha256:0000000000000000000000000000000000000000000000000000000000000000' "$tmp_dir/app/.deploy/previous-digest"
+grep -Fq 'sha256:9999999999999999999999999999999999999999999999999999999999999999' "$tmp_dir/app/.deploy/previous-content-id"
+grep -Fq 'commit-test' "$tmp_dir/app/.deploy/previous-commit"
+test -f "$(cat "$tmp_dir/app/.deploy/rollback-compose-backup")"
 cp "$tmp_dir/app/docker-compose.yml.success" "$tmp_dir/app/docker-compose.yml"
 
 if PATH="$fake_bin:$PATH" DEPLOY_MIN_FREE_KIB=999999999 FAKE_DOCKER_LOG="$fake_docker_log" "$script" --image example/sub2api:3.0 --digest sha256:2222222222222222222222222222222222222222222222222222222222222222 --commit commit-test --deploy-path "$tmp_dir/app" >/dev/null 2>&1; then
@@ -114,5 +118,5 @@ test -d "$tmp_dir/app/.deploy/lock"
 test "$(cat "$tmp_dir/app/.deploy/lock/pid")" = "$$"
 
 printf 'remote deploy script test passed\n'
-grep -Fq 'sha256:0000000000000000000000000000000000000000000000000000000000000000' "$tmp_dir/app/.deploy/current-digest"
+grep -Fq 'sha256:4444444444444444444444444444444444444444444444444444444444444444' "$tmp_dir/app/.deploy/current-digest"
 grep -Fq 'sha256:9999999999999999999999999999999999999999999999999999999999999999' "$tmp_dir/app/.deploy/current-content-id"

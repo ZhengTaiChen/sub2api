@@ -63,10 +63,13 @@ set_env_value() {
 install -d -m 0755 /etc/sub2api /var/lib/sub2api-ops /var/lib/caddy/maintenance /opt/ops-backups/new-api
 install -m 0755 "$SCRIPT_DIR/sub2api-alert.sh" /usr/local/sbin/sub2api-alert
 install -m 0755 "$SCRIPT_DIR/sub2api-housekeeping.sh" /usr/local/sbin/sub2api-housekeeping
+install -m 0755 "$SCRIPT_DIR/sub2api-service-health.sh" /usr/local/sbin/sub2api-service-health
 install -m 0755 "$SCRIPT_DIR/new-api-channel-watchdog.py" /usr/local/sbin/new-api-channel-watchdog
 install -m 0755 "$SCRIPT_DIR/prune-new-api-source.sh" /usr/local/sbin/prune-new-api-source
 install -m 0644 "$REPO_DEPLOY_DIR/systemd/sub2api-housekeeping.service" /etc/systemd/system/sub2api-housekeeping.service
 install -m 0644 "$REPO_DEPLOY_DIR/systemd/sub2api-housekeeping.timer" /etc/systemd/system/sub2api-housekeeping.timer
+install -m 0644 "$REPO_DEPLOY_DIR/systemd/sub2api-service-health.service" /etc/systemd/system/sub2api-service-health.service
+install -m 0644 "$REPO_DEPLOY_DIR/systemd/sub2api-service-health.timer" /etc/systemd/system/sub2api-service-health.timer
 install -m 0644 "$REPO_DEPLOY_DIR/systemd/new-api-channel-watchdog.service" /etc/systemd/system/new-api-channel-watchdog.service
 install -m 0644 "$REPO_DEPLOY_DIR/systemd/new-api-channel-watchdog.timer" /etc/systemd/system/new-api-channel-watchdog.timer
 
@@ -84,5 +87,6 @@ set_env_value /etc/new-api-channel-watchdog.env NEW_API_CHANNEL_WATCHDOG_ALERT_C
 
 systemctl daemon-reload
 systemctl enable --now sub2api-housekeeping.timer
+systemctl enable --now sub2api-service-health.timer
 systemctl enable --now new-api-channel-watchdog.timer
 printf '%s\n' 'Installed Sub2API production housekeeping helpers.'

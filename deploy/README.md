@@ -25,6 +25,8 @@ This directory contains files for deploying Sub2API on Linux servers and Apple-s
 | `install-datamanagementd.sh` | datamanagementd 一键安装脚本 |
 | `sub2api.service` | Systemd service unit file |
 | `sub2api-datamanagementd.service` | datamanagementd systemd service unit file |
+| `ops/` | Production housekeeping, health monitoring, channel isolation, and alert helpers |
+| `remote-deploy.sh` | Immutable image deployment with health checks and rollback |
 | `DATAMANAGEMENTD_CN.md` | datamanagementd 部署与联动说明（中文） |
 | `config.example.yaml` | Example configuration file |
 | `EDGE_SECURITY.md` | Reverse proxy, CDN/WAF, trusted proxy, and ingress hardening guide |

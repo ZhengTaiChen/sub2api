@@ -53,6 +53,7 @@ CONFIG_PATH = Path("/etc/new-api-channel-watchdog.env")
 
 AUTH_OR_BALANCE_PATTERNS = (
     "insufficient_balance",
+    "insufficient_user_quota",
     "insufficient balance",
     "insufficient account balance",
     "credit balance is too low",
@@ -68,6 +69,9 @@ AUTH_OR_BALANCE_PATTERNS = (
     "status_code=403",
     "status code: 401",
     "status code: 403",
+    "余额不足",
+    "额度不足",
+    "余额已用完",
 )
 CANCELLED_PATTERNS = (
     "context canceled",
@@ -76,6 +80,18 @@ CANCELLED_PATTERNS = (
     "client cancelled",
     "client_gone",
     "broken pipe",
+)
+MODEL_OR_ROUTE_FAILURE_PATTERNS = (
+    "model_not_found",
+    "model not found",
+    "model not supported",
+    "unsupported model",
+    "not implemented",
+    "unsupported endpoint",
+    "endpoint not supported",
+    "no available channel for model",
+    "no available channel for this model",
+    "route not found",
 )
 TRANSIENT_FAILURE_RE = re.compile(
     r"(?:status[_ ]code[=: ]+5\d\d|error code:? 524|gateway time-?out|"
@@ -205,6 +221,41 @@ def backup_database(db_path: Path, backup_dir: Path, label: str) -> Path:
     return target
 
 
+def backup_channel_state(
+    state_path: Path,
+    backup_dir: Path,
+    channels: list[sqlite3.Row],
+    state: dict[str, Any],
+    label: str,
+) -> Path:
+    """Save a credential-free state snapshot before mutating channel data."""
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = backup_dir / f"channel-state-{label}-{stamp}.json"
+    suffix = 1
+    while target.exists():
+        target = backup_dir / f"channel-state-{label}-{stamp}-{suffix}.json"
+        suffix += 1
+
+    payload = {
+        "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "source": str(state_path),
+        "statuses": {
+            str(int(channel["id"])): int(channel["status"])
+            for channel in channels
+        },
+        "watchdog_state": state,
+    }
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    temporary.replace(target)
+    return target
+
+
 def parse_channel_urls(base_url: str | None, setting: str | None) -> tuple[list[str], str]:
     urls: list[str] = []
     proxy = ""
@@ -263,13 +314,24 @@ def error_is_cancelled(text: str) -> bool:
     return any(pattern in lowered for pattern in CANCELLED_PATTERNS)
 
 
+def error_is_model_or_route_failure(text: str) -> bool:
+    lowered = text.lower()
+    return any(pattern in lowered for pattern in MODEL_OR_ROUTE_FAILURE_PATTERNS)
+
+
 def error_is_auth_or_balance(text: str) -> bool:
+    if error_is_cancelled(text) or error_is_model_or_route_failure(text):
+        return False
     lowered = text.lower()
     return any(pattern in lowered for pattern in AUTH_OR_BALANCE_PATTERNS)
 
 
 def error_is_transient(text: str) -> bool:
-    return not error_is_cancelled(text) and TRANSIENT_FAILURE_RE.search(text) is not None
+    return (
+        not error_is_cancelled(text)
+        and not error_is_model_or_route_failure(text)
+        and TRANSIENT_FAILURE_RE.search(text) is not None
+    )
 
 
 def load_channels(connection: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -534,24 +596,47 @@ def main() -> int:
 
         channels_by_id = {int(channel["id"]): channel for channel in channels}
         state = read_json(state_path)
-        previous_slow_tests = {
+        previous_alerted_tests = {
             int(key): int(value)
-            for key, value in state.get("slow_test_times", {}).items()
+            for key, value in state.get(
+                "channel_test_times",
+                state.get("slow_test_times", {}),
+            ).items()
             if str(key).isdigit() and isinstance(value, int)
         }
-        slow_alerted_tests: dict[int, int] = {}
+        alerted_test_times: dict[int, int] = {}
         slow_channel_ids: list[int] = []
+        hard_channel_ids: list[int] = []
         for channel_id, (test_time, response_time_ms) in slow_channel_tests.items():
-            slow_alerted_tests[channel_id] = test_time
-            if test_time <= previous_slow_tests.get(channel_id, 0):
+            alerted_test_times[channel_id] = test_time
+            if test_time <= previous_alerted_tests.get(channel_id, 0):
                 continue
             channel = channels_by_id.get(channel_id)
             if channel is None:
                 continue
             response_seconds = response_time_ms / 1000.0
-            message = f"channel #{channel_id} {channel['name']} slow health test: {response_seconds:.2f}s (warning at {slow_seconds:g}s)"
-            emit_event(config, logger, args.dry_run, "warning", "new_api_channel_slow", message)
-            slow_channel_ids.append(channel_id)
+            if response_seconds >= hard_seconds:
+                message = (
+                    f"channel #{channel_id} {channel['name']} hard health-test failure: "
+                    f"{response_seconds:.2f}s (hard limit {hard_seconds:g}s); "
+                    "not isolated until the transient failure rule is met"
+                )
+                emit_event(
+                    config,
+                    logger,
+                    args.dry_run,
+                    "error",
+                    "new_api_channel_hard_latency",
+                    message,
+                )
+                hard_channel_ids.append(channel_id)
+            else:
+                message = (
+                    f"channel #{channel_id} {channel['name']} slow health test: "
+                    f"{response_seconds:.2f}s (warning at {slow_seconds:g}s)"
+                )
+                emit_event(config, logger, args.dry_run, "warning", "new_api_channel_slow", message)
+                slow_channel_ids.append(channel_id)
 
         candidates: dict[int, str] = {}
         for channel in channels:
@@ -579,6 +664,14 @@ def main() -> int:
         if changes_requested and not args.dry_run:
             backup = backup_database(db_path, backup_dir, "before-channel-governance")
             logger.info("created SQLite governance backup: %s", backup.name)
+            state_backup = backup_channel_state(
+                state_path,
+                backup_dir,
+                channels,
+                state,
+                "before-channel-governance",
+            )
+            logger.info("created channel state backup: %s", state_backup.name)
 
         configured_options: list[str] = []
         configured_ids: list[int] = []
@@ -627,8 +720,8 @@ def main() -> int:
                         logger,
                         args.dry_run,
                         "warning",
-                        "new_api_channel_auto_disabled",
-                        f"channel #{channel_id} {channel_name} entered auto-disabled state",
+                        "new_api_channel_disabled_externally",
+                        f"channel #{channel_id} {channel_name} was disabled outside the watchdog; manual verification required",
                     )
 
         for channel_id, reason in isolated_reasons.items():
@@ -648,7 +741,7 @@ def main() -> int:
                     "initialized": True,
                     "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "statuses": {str(key): value for key, value in sorted(current_statuses.items())},
-                    "slow_test_times": {str(key): value for key, value in sorted(slow_alerted_tests.items())},
+                    "channel_test_times": {str(key): value for key, value in sorted(alerted_test_times.items())},
                 },
             )
 
@@ -666,6 +759,7 @@ def main() -> int:
                     "configured_options": configured_options,
                     "dry_run": bool(args.dry_run),
                     "isolated_channel_ids": sorted(isolated_reasons),
+                    "hard_channel_ids": sorted(hard_channel_ids),
                     "slow_channel_ids": sorted(slow_channel_ids),
                     "slow_seconds": slow_seconds,
                     "hard_seconds": hard_seconds,

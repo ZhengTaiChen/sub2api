@@ -66,4 +66,14 @@ content ID. The originally supplied value remains available in
 .deploy/requested-digest, with .deploy/digest-kind set to content for archive
 deployments and manifest for registry deployments.
 
-Deployment state and logs are stored under `/opt/sub2api/.deploy`. The newest Compose backup and previous image reference are retained for rollback.
+Deployment state and logs are stored under `/opt/sub2api/.deploy`. The newest Compose backup and the complete previous-release identity are retained for rollback: `previous-image`, `previous-digest`, `previous-content-id`, and `previous-commit`. `rollback-compose-backup` points to the retained pre-switch Compose file.
+
+## Production Operations
+
+Install the production-only helpers as root after copying the `deploy/ops` and `deploy/systemd` files to the server:
+
+```sh
+sudo deploy/ops/install-production-ops.sh --deploy-path /opt/sub2api
+```
+
+The installer enables three conservative timers: daily Docker/disk housekeeping, the new-api channel watchdog, and a one-minute Sub2API health monitor. The health monitor checks the Docker health state, `http://127.0.0.1:8082/health`, and the configured edge health URL. It suppresses probes while the deployment maintenance marker exists and only sends webhook events on unhealthy/recovered transitions. The webhook URL remains outside the repository in `/etc/sub2api/alert-webhook-url` with root-only permissions.

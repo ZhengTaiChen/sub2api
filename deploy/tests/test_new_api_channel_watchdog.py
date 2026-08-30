@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sqlite3
 import tempfile
 from unittest import mock
@@ -62,9 +63,46 @@ class WatchdogTest(unittest.TestCase):
 
     def test_error_classification_excludes_client_cancellation(self):
         self.assertTrue(WATCHDOG.error_is_auth_or_balance("status_code=403, insufficient account balance"))
+        self.assertTrue(WATCHDOG.error_is_auth_or_balance("余额不足"))
+        self.assertTrue(WATCHDOG.error_is_auth_or_balance("insufficient_user_quota"))
+        self.assertFalse(WATCHDOG.error_is_auth_or_balance("status_code=401, model_not_found"))
+        self.assertFalse(WATCHDOG.error_is_auth_or_balance("No available channel for model"))
+        self.assertFalse(WATCHDOG.error_is_auth_or_balance("route not found, status_code=401"))
+        self.assertFalse(WATCHDOG.error_is_auth_or_balance("status_code=500, not implemented"))
         self.assertTrue(WATCHDOG.error_is_transient("status_code=524, gateway timeout"))
         self.assertFalse(WATCHDOG.error_is_transient("context canceled after timeout"))
         self.assertFalse(WATCHDOG.error_is_transient("client disconnected; broken pipe"))
+        self.assertFalse(WATCHDOG.error_is_transient("model not supported after gateway timeout"))
+        self.assertFalse(WATCHDOG.error_is_transient("status_code=500, unsupported endpoint"))
+
+    def test_channel_state_backup_contains_only_governance_state(self):
+        connection = self.connect()
+        connection.execute("INSERT INTO channels(id, name, status) VALUES (26, 'low balance', 3)")
+        connection.execute("INSERT INTO channels(id, name, status) VALUES (63, 'not implemented', 1)")
+        connection.commit()
+        channels = WATCHDOG.load_channels(connection)
+        connection.close()
+
+        state_path = Path(self.temp_dir.name) / "state.json"
+        state_path.write_text('{"initialized": true, "statuses": {"26": 3}}\n', encoding="utf-8")
+        backup_dir = Path(self.temp_dir.name) / "backups"
+        backup = WATCHDOG.backup_channel_state(
+            state_path,
+            backup_dir,
+            channels,
+            {"initialized": True, "statuses": {"26": 3}},
+            "before-test",
+        )
+
+        self.assertTrue(backup.is_file())
+        self.assertEqual(0o600, backup.stat().st_mode & 0o777)
+        payload = json.loads(backup.read_text(encoding="utf-8"))
+        self.assertEqual({"26": 3, "63": 1}, payload["statuses"])
+        self.assertEqual({"initialized": True, "statuses": {"26": 3}}, payload["watchdog_state"])
+        self.assertEqual(
+            {"captured_at", "source", "statuses", "watchdog_state"},
+            set(payload),
+        )
 
     def test_isolate_channels_disables_abilities_in_one_transaction(self):
         connection = self.connect()
@@ -157,6 +195,19 @@ class WatchdogTest(unittest.TestCase):
         result = WATCHDOG.load_recent_slow_channel_tests(connection, 900, 15.0)
 
         self.assertEqual({1: (950, 16000)}, result)
+        connection.close()
+
+    def test_hard_latency_is_included_in_channel_test_results(self):
+        connection = self.connect()
+        connection.execute(
+            "INSERT INTO channels(id, name, status, test_time, response_time) VALUES (?, ?, ?, ?, ?)",
+            (1, "hard", 1, 950, 45000),
+        )
+        connection.commit()
+
+        result = WATCHDOG.load_recent_slow_channel_tests(connection, 900, 15.0)
+
+        self.assertEqual({1: (950, 45000)}, result)
         connection.close()
 
     def test_parse_channel_urls_deduplicates_and_keeps_proxy(self):

@@ -69,9 +69,13 @@ protected_image_ids() {
     docker ps -aq | xargs -r docker inspect --format '{{.Image}}' 2>/dev/null || true
     docker image inspect sub2api-retain:current --format '{{.Id}}' 2>/dev/null || true
     docker image inspect sub2api-retain:previous --format '{{.Id}}' 2>/dev/null || true
-    for state_file in "$STATE_DIR/current-image" "$STATE_DIR/previous-image"; do
+    for state_file in \
+      "$STATE_DIR/current-image" \
+      "$STATE_DIR/previous-image" \
+      "$STATE_DIR/current-content-id" \
+      "$STATE_DIR/previous-content-id"; do
       [ -r "$state_file" ] || continue
-      image_ref=$(tr -d '\r\n' < "$state_file")
+      image_ref=$(sed -n '1{s/\r$//;p;}' "$state_file")
       [ -n "$image_ref" ] || continue
       docker image inspect "$image_ref" --format '{{.Id}}' 2>/dev/null || true
     done
@@ -88,7 +92,9 @@ prune_old_release_images() {
   [ -n "$RELEASE_IMAGE_PREFIX" ] || return 0
   protected=$(protected_image_ids)
 
-  docker image ls --format '{{.Repository}} {{.ID}}' |
+  # Use full IDs here; protected_image_ids contains daemon IDs, not the
+  # default 12-character display IDs returned by `docker image ls`.
+  docker image ls --no-trunc --format '{{.Repository}} {{.ID}}' |
     awk -v prefix="$RELEASE_IMAGE_PREFIX" '$1 == prefix { print $2 }' |
     sort -u |
     while IFS= read -r image_id; do
