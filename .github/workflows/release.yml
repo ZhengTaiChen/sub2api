@@ -230,6 +230,23 @@ jobs:
           echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
           echo "Resolved ${IMAGE}@${DIGEST}"
 
+      - name: Export amd64 deployment image
+        if: ${{ env.SIMPLE_RELEASE == 'true' }}
+        env:
+          IMAGE: ${{ steps.image_metadata.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "${IMAGE}"
+          docker save "${IMAGE}" -o sub2api-image.tar
+
+      - name: Upload amd64 deployment image
+        if: ${{ env.SIMPLE_RELEASE == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: sub2api-image-${{ steps.image_metadata.outputs.version }}
+          path: sub2api-image.tar
+          retention-days: 1
+
       # Update DockerHub description
       - name: Update DockerHub description
         if: ${{ env.SIMPLE_RELEASE != 'true' && env.DOCKERHUB_USERNAME != '' }}

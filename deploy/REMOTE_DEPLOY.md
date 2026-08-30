@@ -2,6 +2,10 @@
 
 `remote-deploy.sh` is the production deployment entrypoint used by GitHub Actions. It never builds source code on the target host.
 
+The preferred local release path downloads the amd64 image archive produced by
+the release workflow, transfers it to the host, and invokes this script with
+`--skip-pull`. The host therefore does not need direct GHCR access.
+
 ## Server prerequisites
 
 - Docker Engine and `docker compose` are installed.
